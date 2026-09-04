@@ -54,24 +54,40 @@ kernel `7.1.3+deb14-amd64`.
 
 ## Running the application
 
-Python 3 and Tkinter are required. On Debian, Tkinter is provided by the
-`python3-tk` package.
+Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/) are required.
+The desktop interface uses PySide6 and automatically reflows its controls and
+telemetry cards to fit the available window. Hovering over a tab activates it;
+click and keyboard navigation remain available.
+
+Create the virtual environment and install the locked dependencies:
+
+```bash
+uv sync
+```
 
 Run the GUI with simulated telemetry first:
 
 ```bash
-python3 -m medion_fan_control --demo
+uv run medion-fan-control --demo
 ```
 
 Run the test suite:
 
 ```bash
-python3 -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 The current prototype opens `/dev/port` itself, so the hardware GUI requires
 administrator access. Kernel lockdown also blocks `/dev/port`, including for
-root. Secure Boot commonly enables lockdown; verify that `none` is selected:
+root. Before opening the EC transport, the application checks the UEFI Secure
+Boot variable and the kernel lockdown mode. If either blocks EC access, it
+shows setup instructions and does not attempt any port reads or writes.
+
+Secure Boot must be disabled in the laptop's UEFI/BIOS setup. Restart, use the
+setup key shown during startup (commonly F2), find **Secure Boot** under the
+Security or Boot settings, disable it, then save and reboot. Ensure any disk
+encryption recovery key is available before changing firmware settings.
+After rebooting, verify that `none` is selected:
 
 ```bash
 cat /sys/kernel/security/lockdown
@@ -81,8 +97,18 @@ cat /sys/kernel/security/lockdown
 Then run:
 
 ```bash
-sudo -E python3 -m medion_fan_control
+sudo -E "$(pwd)/.venv/bin/medion-fan-control"
 ```
+
+Build the source distribution and wheel locally with Hatchling:
+
+```bash
+uv build
+```
+
+Pushing a version tag such as `v0.1.0` runs the GitHub release workflow. It
+installs the locked `uv` environment, runs the tests, builds both package
+formats with Hatchling, and attaches them to a GitHub release for that tag.
 
 The hardware session:
 

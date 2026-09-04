@@ -1,6 +1,13 @@
+import os
 import unittest
+from unittest.mock import patch
 
-from medion_fan_control.gui import DemoController, TelemetryHistory, format_duration
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from medion_fan_control.gui import DemoController, FanControlApp, TelemetryHistory, format_duration
+from medion_fan_control.hardware import HardwareAccessError, PlatformSecurityStatus
 from medion_fan_control.protocol import FanStatus, Profile
 
 
@@ -54,6 +61,60 @@ class DemoControllerTests(unittest.TestCase):
         self.assertTrue(status.full_speed)
         self.assertEqual(status.cpu_fan_rpm, 5900)
         self.assertEqual(status.gpu_fan_rpm, 5600)
+
+
+class PlatformSecurityDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        with patch("medion_fan_control.gui.load_lighting_colors", return_value={}):
+            self.window = FanControlApp(demo=True)
+        self.window.demo = False
+
+    def tearDown(self):
+        self.window.close()
+
+    def test_blocks_connection_and_shows_secure_boot_instructions(self):
+        security = PlatformSecurityStatus(secure_boot_enabled=True, lockdown_mode="integrity")
+
+        with (
+            patch("medion_fan_control.gui.read_platform_security", return_value=security),
+            patch.object(QMessageBox, "critical") as critical,
+        ):
+            allowed = self.window._platform_security_allows_ec_access()
+
+        self.assertFalse(allowed)
+        self.assertEqual(self.window.connection_label.text(), "SECURE BOOT ENABLED")
+        self.assertIn("EC access is disabled", self.window.status_label.text())
+        self.assertIn("Set Secure Boot to Disabled", critical.call_args.args[2])
+
+    def test_blocks_connection_when_security_state_cannot_be_read(self):
+        with (
+            patch(
+                "medion_fan_control.gui.read_platform_security",
+                side_effect=HardwareAccessError("cannot read Secure Boot state"),
+            ),
+            patch.object(QMessageBox, "critical") as critical,
+        ):
+            allowed = self.window._platform_security_allows_ec_access()
+
+        self.assertFalse(allowed)
+        self.assertEqual(self.window.connection_label.text(), "SECURITY CHECK FAILED")
+        self.assertIn("blocked for safety", critical.call_args.args[2])
+
+    def test_allows_connection_without_a_modal_when_security_is_disabled(self):
+        security = PlatformSecurityStatus(secure_boot_enabled=False, lockdown_mode="none")
+
+        with (
+            patch("medion_fan_control.gui.read_platform_security", return_value=security),
+            patch.object(QMessageBox, "critical") as critical,
+        ):
+            allowed = self.window._platform_security_allows_ec_access()
+
+        self.assertTrue(allowed)
+        critical.assert_not_called()
 
 
 if __name__ == "__main__":
