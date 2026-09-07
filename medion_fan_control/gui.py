@@ -1,25 +1,17 @@
 from __future__ import annotations
 
-import argparse
-import math
-import sys
-import time
-from collections import deque
-from collections.abc import Callable, Iterator
+import logging
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass
-from typing import Protocol
+from dataclasses import replace
 
-from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QTimer
-from PySide6.QtGui import QColor, QCloseEvent, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication,
     QButtonGroup,
     QCheckBox,
     QColorDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -27,375 +19,48 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from .controller import (
+    LIGHTING_ERRORS,
+    SESSION_ERRORS,
+    ProtocolSession,
+    apply_and_save_lighting,
+    open_demo_protocol,
+)
 from .hardware import HardwareAccessError, open_supported_protocol, read_platform_security
 from .lighting import (
     LightingAccessError,
     LightZone,
     RgbColor,
     apply_static_lighting,
-    load_lighting_colors,
-    save_lighting_colors,
 )
 from .protocol import FanStatus, InsufficientPowerError, Profile, TURBO_POWER_MESSAGE
+from .settings import load_lighting_colors
+from .telemetry import TelemetryHistory, format_duration
+from .theme import (
+    ACCENT,
+    APP_STYLESHEET,
+    BORDER,
+    CPU_COLOR,
+    ERROR,
+    GPU_COLOR,
+    INK,
+    SIDEBAR,
+    SURFACE,
+    WARNING,
+    lighting_text_color,
+)
+from .widgets import ResponsiveGrid, TelemetryGraph
 
 
-BACKGROUND = "#edf1ed"
-SURFACE = "#ffffff"
-INK = "#17231e"
-MUTED = "#64736c"
-BORDER = "#d5ded8"
-GRID = "#e1e8e3"
-SIDEBAR = "#173d34"
-SIDEBAR_MUTED = "#a9c0b8"
-ACCENT = "#10a477"
-CPU_COLOR = "#df5a3f"
-GPU_COLOR = "#2475a8"
-WARNING = "#e6ad3a"
-ERROR = "#bd3f35"
 DEFAULT_LIGHTING_COLOR = RgbColor(255, 255, 255)
 LIGHTING_ZONE_ORDER = (LightZone.KEYBOARD, LightZone.LID, LightZone.LEFT_SIDE, LightZone.RIGHT_SIDE)
-
-
-class FanController(Protocol):
-    def read_status(self) -> FanStatus: ...
-
-    def set_profile(self, profile: Profile) -> Profile: ...
-
-    def set_full_speed(self, enabled: bool) -> bool: ...
-
-
-@dataclass(frozen=True)
-class TelemetrySample:
-    recorded_at: float
-    status: FanStatus
-
-
-class TelemetryHistory:
-    def __init__(self, max_samples: int = 480) -> None:
-        if max_samples < 1:
-            raise ValueError("max_samples must be at least 1")
-        self._samples: deque[TelemetrySample] = deque(maxlen=max_samples)
-
-    @property
-    def samples(self) -> tuple[TelemetrySample, ...]:
-        return tuple(self._samples)
-
-    def append(self, status: FanStatus, recorded_at: float | None = None) -> None:
-        self._samples.append(TelemetrySample(time.monotonic() if recorded_at is None else recorded_at, status))
-
-    def samples_for_window(
-        self,
-        duration_seconds: int,
-        *,
-        now: float | None = None,
-    ) -> tuple[TelemetrySample, ...]:
-        if duration_seconds < 1:
-            raise ValueError("duration must be at least 1 second")
-        cutoff = (time.monotonic() if now is None else now) - duration_seconds
-        return tuple(sample for sample in self._samples if sample.recorded_at >= cutoff)
-
-
-def format_duration(seconds: int) -> str:
-    minutes, remaining_seconds = divmod(seconds, 60)
-    if not minutes:
-        return f"{remaining_seconds}s"
-    if not remaining_seconds:
-        return f"{minutes} min"
-    return f"{minutes}m {remaining_seconds}s"
-
-
-def lighting_text_color(color: RgbColor) -> str:
-    luminance = (299 * color.red + 587 * color.green + 114 * color.blue) / 1000
-    return INK if luminance >= 145 else "#ffffff"
-
-
-class DemoController:
-    def __init__(self) -> None:
-        self.profile = Profile.OFFICE
-        self.full_speed = False
-        self._started_at = time.monotonic()
-
-    def read_status(self) -> FanStatus:
-        elapsed = time.monotonic() - self._started_at
-        profile_offset = (self.profile.value - 1) * 450
-        cpu_temperature = round(58 + 11 * math.sin(elapsed / 11))
-        gpu_temperature = round(50 + 9 * math.sin(elapsed / 14 + 0.8))
-        if self.full_speed:
-            cpu_rpm = 5900
-            gpu_rpm = 5600
-        else:
-            cpu_rpm = max(1250, round(1150 + cpu_temperature * 28 + profile_offset))
-            gpu_rpm = max(1100, round(1000 + gpu_temperature * 26 + profile_offset))
-        return FanStatus(
-            profile=self.profile,
-            full_speed=self.full_speed,
-            cpu_fan_rpm=cpu_rpm,
-            gpu_fan_rpm=gpu_rpm,
-            cpu_temperature_c=cpu_temperature,
-            gpu_temperature_c=gpu_temperature,
-        )
-
-    def set_profile(self, profile: Profile) -> Profile:
-        self.profile = Profile(profile)
-        return self.profile
-
-    def set_full_speed(self, enabled: bool) -> bool:
-        self.full_speed = bool(enabled)
-        return self.full_speed
-
-
-@contextmanager
-def open_demo_protocol() -> Iterator[DemoController]:
-    yield DemoController()
-
-
-class ProtocolSession:
-    def __init__(self, factory: Callable[[], AbstractContextManager[FanController]]) -> None:
-        self._factory = factory
-        self._context: AbstractContextManager[FanController] | None = None
-        self._controller: FanController | None = None
-
-    def open(self) -> FanStatus:
-        if self._controller is not None:
-            return self._controller.read_status()
-        self._context = self._factory()
-        self._controller = self._context.__enter__()
-        return self._controller.read_status()
-
-    def close(self) -> None:
-        if self._context is not None:
-            self._context.__exit__(None, None, None)
-        self._context = None
-        self._controller = None
-
-    def read_status(self) -> FanStatus:
-        return self._require_controller().read_status()
-
-    def set_profile(self, profile: Profile) -> FanStatus:
-        controller = self._require_controller()
-        controller.set_profile(profile)
-        return controller.read_status()
-
-    def set_full_speed(self, enabled: bool) -> FanStatus:
-        controller = self._require_controller()
-        controller.set_full_speed(enabled)
-        return controller.read_status()
-
-    def _require_controller(self) -> FanController:
-        if self._controller is None:
-            raise RuntimeError("hardware session is not open")
-        return self._controller
-
-
-class HoverTabWidget(QTabWidget):
-    """Select tabs on pointer hover while retaining normal click/keyboard use."""
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.tabBar().setMouseTracking(True)
-        self.tabBar().installEventFilter(self)
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is self.tabBar() and event.type() == QEvent.Type.MouseMove:
-            tab_index = self.tabBar().tabAt(event.position().toPoint())
-            if tab_index >= 0:
-                self.setCurrentIndex(tab_index)
-        return super().eventFilter(watched, event)
-
-
-class ResponsiveGrid(QWidget):
-    def __init__(
-        self,
-        widgets: list[QWidget],
-        *,
-        wide_columns: int,
-        medium_columns: int = 2,
-        medium_width: int = 720,
-        wide_width: int = 1080,
-    ) -> None:
-        super().__init__()
-        self._widgets = widgets
-        self._wide_columns = wide_columns
-        self._medium_columns = medium_columns
-        self._medium_width = medium_width
-        self._wide_width = wide_width
-        self._columns = 0
-        self._layout = QGridLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setHorizontalSpacing(12)
-        self._layout.setVerticalSpacing(12)
-        self._reflow(wide_columns)
-
-    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        width = event.size().width()
-        columns = (
-            self._wide_columns
-            if width >= self._wide_width
-            else self._medium_columns
-            if width >= self._medium_width
-            else 1
-        )
-        self._reflow(columns)
-        super().resizeEvent(event)
-
-    def _reflow(self, columns: int) -> None:
-        if columns == self._columns:
-            return
-        self._columns = columns
-        for index, widget in enumerate(self._widgets):
-            self._layout.addWidget(widget, index // columns, index % columns)
-        for column in range(self._wide_columns):
-            self._layout.setColumnStretch(column, 1 if column < columns else 0)
-
-
-class TelemetryGraph(QWidget):
-    def __init__(self, history: TelemetryHistory, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self._history = history
-        self._window_seconds = 180
-        self.setMinimumHeight(280)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-
-    def set_window_seconds(self, seconds: int) -> None:
-        self._window_seconds = seconds
-        self.update()
-
-    def paintEvent(self, _event) -> None:  # type: ignore[no-untyped-def]
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(SURFACE))
-        width = self.width()
-        height = self.height()
-        left, top, right, bottom = 64.0, 24.0, width - 64.0, height - 44.0
-        if right <= left or bottom <= top:
-            return
-
-        now = time.monotonic()
-        duration = self._window_seconds
-        samples = self._history.samples_for_window(duration, now=now)
-        maximum_rpm = max(
-            (max(sample.status.cpu_fan_rpm, sample.status.gpu_fan_rpm) for sample in samples),
-            default=5000,
-        )
-        fan_max = max(6000, math.ceil(maximum_rpm / 1000) * 1000)
-        maximum_temperature = max(
-            (max(sample.status.cpu_temperature_c, sample.status.gpu_temperature_c) for sample in samples),
-            default=100,
-        )
-        temperature_max = max(100, math.ceil(maximum_temperature / 20) * 20)
-
-        painter.setFont(QFont("DejaVu Sans", 8))
-        for step in range(5):
-            fraction = step / 4
-            y = bottom - fraction * (bottom - top)
-            painter.setPen(QPen(QColor(GRID), 1))
-            painter.drawLine(QPointF(left, y), QPointF(right, y))
-            painter.setPen(QColor(MUTED))
-            painter.drawText(0, int(y - 10), int(left - 10), 20, Qt.AlignmentFlag.AlignRight, f"{round(fraction * fan_max):,}")
-            painter.drawText(int(right + 10), int(y - 10), 42, 20, Qt.AlignmentFlag.AlignLeft, str(round(fraction * temperature_max)))
-
-        for step in range(5):
-            fraction = step / 4
-            x = left + fraction * (right - left)
-            age = round(duration * (1 - fraction))
-            painter.setPen(QPen(QColor(GRID), 1))
-            painter.drawLine(QPointF(x, top), QPointF(x, bottom))
-            painter.setPen(QColor(MUTED))
-            label = "NOW" if age == 0 else f"-{format_duration(age)}"
-            painter.drawText(int(x - 40), int(bottom + 8), 80, 20, Qt.AlignmentFlag.AlignCenter, label)
-
-        painter.setPen(QPen(QColor(INK), 2))
-        painter.drawLine(QPointF(left, top), QPointF(left, bottom))
-        painter.drawLine(QPointF(left, bottom), QPointF(right, bottom))
-        painter.drawLine(QPointF(right, top), QPointF(right, bottom))
-
-        if not samples:
-            painter.setPen(QColor(MUTED))
-            painter.setFont(QFont("DejaVu Sans", 10, QFont.Weight.Bold))
-            painter.drawText(
-                int(left),
-                int(top),
-                int(right - left),
-                int(bottom - top),
-                Qt.AlignmentFlag.AlignCenter,
-                "WAITING FOR EC TELEMETRY",
-            )
-            return
-
-        start = now - duration
-        self._draw_series(painter, samples, "cpu_fan_rpm", CPU_COLOR, start, duration, left, top, right, bottom, fan_max)
-        self._draw_series(painter, samples, "gpu_fan_rpm", GPU_COLOR, start, duration, left, top, right, bottom, fan_max)
-        self._draw_series(
-            painter,
-            samples,
-            "cpu_temperature_c",
-            CPU_COLOR,
-            start,
-            duration,
-            left,
-            top,
-            right,
-            bottom,
-            temperature_max,
-            dashed=True,
-        )
-        self._draw_series(
-            painter,
-            samples,
-            "gpu_temperature_c",
-            GPU_COLOR,
-            start,
-            duration,
-            left,
-            top,
-            right,
-            bottom,
-            temperature_max,
-            dashed=True,
-        )
-
-    @staticmethod
-    def _draw_series(
-        painter: QPainter,
-        samples: tuple[TelemetrySample, ...],
-        field: str,
-        color: str,
-        start: float,
-        duration: int,
-        left: float,
-        top: float,
-        right: float,
-        bottom: float,
-        value_max: int,
-        *,
-        dashed: bool = False,
-    ) -> None:
-        path = QPainterPath()
-        last_point: QPointF | None = None
-        for index, sample in enumerate(samples):
-            value = getattr(sample.status, field)
-            point = QPointF(
-                left + (sample.recorded_at - start) / duration * (right - left),
-                bottom - min(value, value_max) / value_max * (bottom - top),
-            )
-            path.moveTo(point) if index == 0 else path.lineTo(point)
-            last_point = point
-        pen = QPen(QColor(color), 2)
-        if dashed:
-            pen.setStyle(Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        painter.drawPath(path)
-        if last_point is not None:
-            painter.setBrush(QColor(color))
-            painter.setPen(QPen(QColor(SURFACE), 1))
-            painter.drawEllipse(last_point, 4, 4)
+logger = logging.getLogger(__name__)
 
 
 class FanControlApp(QMainWindow):
@@ -412,15 +77,18 @@ class FanControlApp(QMainWindow):
         self._pending: Future[FanStatus] | None = None
         self._lighting_pending: Future[None] | None = None
         self._closing = False
+        self._change_in_progress = False
         self._current_status: FanStatus | None = None
         self._mode_buttons: dict[Profile, QRadioButton] = {}
         self._lighting_swatches: dict[LightZone, QPushButton] = {}
         self._lighting_load_error: str | None = None
+        self._lighting_restore_attempted = False
         try:
-            self._lighting_colors = load_lighting_colors()
+            self._saved_lighting_colors = {} if demo else load_lighting_colors()
         except LightingAccessError as error:
-            self._lighting_colors = {}
+            self._saved_lighting_colors = {}
             self._lighting_load_error = str(error)
+        self._lighting_colors = dict(self._saved_lighting_colors)
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setSingleShot(True)
@@ -431,48 +99,16 @@ class FanControlApp(QMainWindow):
         self._build_layout()
         self._set_controls_enabled(False)
         self._update_lighting_controls()
+        if self._lighting_load_error is not None:
+            self.lighting_status_label.setText(self._lighting_load_error)
         QTimer.singleShot(0, self._open_session)
 
     def _configure_window(self) -> None:
-        self.setWindowTitle("Medion Major X10 Control")
+        title = "Medion Major X10 Control"
+        self.setWindowTitle(f"{title} - Demo" if self.demo else title)
         self.resize(1180, 820)
         self.setMinimumSize(720, 560)
-        self.setStyleSheet(
-            f"""
-            QMainWindow, QWidget#root {{ background: {BACKGROUND}; color: {INK}; }}
-            QLabel {{ color: {INK}; }}
-            QLabel#brand {{ color: white; font-size: 22px; font-weight: 800; }}
-            QLabel#subtitle, QLabel#status, QLabel[role="muted"] {{ color: {MUTED}; }}
-            QLabel#title {{ font-size: 25px; font-weight: 800; }}
-            QLabel#sectionTitle {{ font-size: 16px; font-weight: 700; }}
-            QLabel#metricName {{ color: {MUTED}; font-size: 10px; font-weight: 700; }}
-            QLabel#metricValue {{ color: {INK}; font: 700 23px "DejaVu Sans Mono"; }}
-            QFrame[panel="true"] {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 12px; }}
-            QPushButton, QRadioButton {{
-                border: 1px solid {BORDER}; border-radius: 8px; padding: 9px 14px;
-                background: {SURFACE}; color: {INK}; font-weight: 600;
-            }}
-            QPushButton:hover, QRadioButton:hover {{ border-color: {ACCENT}; background: #f3faf7; }}
-            QRadioButton::indicator {{ width: 0; height: 0; }}
-            QRadioButton:checked {{ background: {SIDEBAR}; color: white; border-color: {SIDEBAR}; }}
-            QPushButton[role="primary"] {{ background: {ACCENT}; color: white; border-color: {ACCENT}; }}
-            QPushButton[role="primary"]:hover {{ background: #0c8c65; }}
-            QPushButton:disabled, QRadioButton:disabled {{ color: #98a49f; background: #edf0ee; }}
-            QCheckBox {{ spacing: 8px; font-weight: 600; }}
-            QTabWidget::pane {{ border: 0; background: transparent; }}
-            QTabBar::tab {{
-                background: transparent; color: {MUTED}; padding: 12px 22px;
-                border-bottom: 3px solid transparent; font-weight: 700;
-            }}
-            QTabBar::tab:hover {{ color: {ACCENT}; background: #e5eee9; }}
-            QTabBar::tab:selected {{ color: {INK}; border-bottom-color: {ACCENT}; }}
-            QSlider::groove:horizontal {{ height: 5px; background: {GRID}; border-radius: 2px; }}
-            QSlider::handle:horizontal {{
-                background: {ACCENT}; width: 16px; margin: -6px 0; border-radius: 8px;
-            }}
-            QScrollArea {{ border: 0; background: transparent; }}
-            """
-        )
+        self.setStyleSheet(APP_STYLESHEET)
 
     def _build_layout(self) -> None:
         root = QWidget(objectName="root")
@@ -487,22 +123,26 @@ class FanControlApp(QMainWindow):
         heading = QVBoxLayout()
         heading.setSpacing(0)
         heading.addWidget(QLabel("System control", objectName="title"))
-        heading.addWidget(QLabel("Verified firmware telemetry, modes, and lighting", objectName="subtitle"))
-        header.addLayout(heading)
-        header.addStretch()
+        subtitle = "Demo mode - no hardware access" if self.demo else "Firmware telemetry, modes, and lighting"
+        subtitle_label = QLabel(subtitle, objectName="subtitle")
+        subtitle_label.setWordWrap(True)
+        heading.addWidget(subtitle_label)
+        header.addLayout(heading, 1)
         self.profile_badge = QLabel("UNKNOWN MODE")
+        self.profile_badge.setWordWrap(True)
+        self.profile_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.profile_badge.setStyleSheet(
             f"background: {WARNING}; color: {INK}; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
         )
         header.addWidget(self.profile_badge)
         root_layout.addLayout(header)
 
-        self.tabs = HoverTabWidget()
+        self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.addTab(self._scrollable_page(self._build_dashboard()), "Dashboard")
         self.tabs.addTab(self._scrollable_page(self._build_lighting_page()), "Lighting")
-        self.tabs.setTabToolTip(0, "Hover to show fan controls and telemetry")
-        self.tabs.setTabToolTip(1, "Hover to show static lighting controls")
+        self.tabs.setTabToolTip(0, "Fan controls and telemetry")
+        self.tabs.setTabToolTip(1, "Static lighting controls")
         root_layout.addWidget(self.tabs, 1)
 
         footer = QHBoxLayout()
@@ -511,6 +151,7 @@ class FanControlApp(QMainWindow):
         footer.addWidget(self.connection_label)
         self.status_label = QLabel("Opening the verified EC transport...", objectName="status")
         self.status_label.setWordWrap(True)
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         footer.addWidget(self.status_label, 1)
         self.retry_button = QPushButton("Retry connection")
         self.retry_button.clicked.connect(self._open_session)
@@ -527,7 +168,7 @@ class FanControlApp(QMainWindow):
         return scroll
 
     def _build_dashboard(self) -> QWidget:
-        page = QWidget()
+        page = QWidget(objectName="page")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(2, 8, 2, 8)
         layout.setSpacing(14)
@@ -546,11 +187,19 @@ class FanControlApp(QMainWindow):
             profile_buttons.addWidget(button)
             self._mode_buttons[profile] = button
         profile_layout.addLayout(profile_buttons)
+        self.power_label = QLabel("Power supply: unknown")
+        self.power_label.setProperty("role", "muted")
+        self.power_label.setWordWrap(True)
+        profile_layout.addWidget(self.power_label)
         controls_layout.addLayout(profile_layout, 1)
         controls_layout.addSpacing(24)
         override_layout = QVBoxLayout()
         override_layout.addWidget(QLabel("Fan override", objectName="sectionTitle"))
         self.full_speed_check = QCheckBox("Full speed")
+        self.full_speed_check.setToolTip(
+            "Runs both fans at full speed. Turn this off to resume the selected firmware profile. "
+            "Closing the app does not turn it off."
+        )
         self.full_speed_check.clicked.connect(self._request_full_speed_change)
         override_layout.addWidget(self.full_speed_check)
         controls_layout.addLayout(override_layout)
@@ -580,6 +229,8 @@ class FanControlApp(QMainWindow):
         self.window_slider.setRange(1, 20)
         self.window_slider.setValue(6)
         self.window_slider.setMaximumWidth(180)
+        self.window_slider.setAccessibleName("Telemetry time window")
+        self.window_slider.setToolTip("Show the last 30 seconds to 10 minutes of telemetry")
         self.window_slider.valueChanged.connect(self._graph_window_changed)
         graph_header.addWidget(self.window_slider)
         self.window_label = QLabel("3 min", objectName="metricName")
@@ -600,7 +251,7 @@ class FanControlApp(QMainWindow):
         return page
 
     def _build_lighting_page(self) -> QWidget:
-        page = QWidget()
+        page = QWidget(objectName="page")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(2, 8, 2, 8)
         layout.setSpacing(14)
@@ -612,11 +263,21 @@ class FanControlApp(QMainWindow):
         text.addWidget(QLabel("Static chassis lighting", objectName="sectionTitle"))
         description = QLabel(
             "Choose colors for all zones or tune each zone independently. "
-            "Changes are written only after confirmation."
+            "Apply colors asks for confirmation and saves the selection for the next launch."
+            if not self.demo else
+            "Preview colors for all zones or tune each zone independently. "
+            "Demo mode never changes hardware or saved settings."
         )
         description.setObjectName("subtitle")
         description.setWordWrap(True)
         text.addWidget(description)
+        self.lighting_status_label = QLabel(
+            "Saved colors are restored once when the hardware session connects."
+            if not self.demo else "Demo lighting preview - nothing will be written or saved."
+        )
+        self.lighting_status_label.setWordWrap(True)
+        self.lighting_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        text.addWidget(self.lighting_status_label)
         intro_layout.addLayout(text, 1)
         self.apply_lighting_button = QPushButton("Apply colors")
         self.apply_lighting_button.setProperty("role", "primary")
@@ -694,6 +355,7 @@ class FanControlApp(QMainWindow):
         for target_zone in target_zones:
             self._lighting_colors[target_zone] = color
         self._refresh_lighting_swatches()
+        self.lighting_status_label.setText("Unapplied colors. Select Apply colors to confirm the selection.")
         self._update_lighting_controls()
 
     @staticmethod
@@ -702,6 +364,7 @@ class FanControlApp(QMainWindow):
             f"QPushButton {{ background: {color}; color: {text_color}; border: 1px solid {BORDER}; "
             "border-radius: 10px; font-weight: 700; }"
             f"QPushButton:hover {{ border: 2px solid {ACCENT}; background: {color}; }}"
+            f"QPushButton:focus {{ outline: 2px solid {INK}; outline-offset: 2px; }}"
         )
 
     def _refresh_lighting_swatches(self) -> None:
@@ -724,20 +387,27 @@ class FanControlApp(QMainWindow):
             self.all_lighting_button.setStyleSheet(self._swatch_style(SURFACE, INK))
 
     def _request_lighting_change(self) -> None:
-        if self.demo or self._lighting_pending is not None or not self._lighting_colors:
+        if self._closing or self._lighting_pending is not None or not self._lighting_colors:
             return
         colors = dict(self._lighting_colors)
         zone_names = ", ".join(zone.label for zone in colors)
         answer = QMessageBox.question(
             self,
             "Apply lighting colors",
-            f"Apply static colors to {zone_names}?",
+            f"Preview static colors for {zone_names}? No hardware or settings will change."
+            if self.demo else
+            f"Apply static colors to {zone_names} and save them to restore at the next launch?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        self.status_label.setText(f"Applying static lighting to {zone_names}...")
-        self._lighting_pending = self.lighting_executor.submit(apply_static_lighting, colors)
+        if self.demo:
+            self.lighting_status_label.setText(f"Demo colors applied to {zone_names}; nothing was written or saved.")
+            return
+        self._lighting_restore_attempted = True
+        self.lighting_status_label.setText(f"Applying static lighting to {zone_names}...")
+        self._lighting_pending = self.lighting_executor.submit(apply_and_save_lighting, colors)
         self._update_lighting_controls()
         self._watch_lighting_future(self._lighting_pending, colors, zone_names, save_on_success=True)
 
@@ -759,32 +429,32 @@ class FanControlApp(QMainWindow):
         self._lighting_pending = None
         try:
             future.result()
-        except Exception as error:
-            self.status_label.setText(str(error))
+        except LIGHTING_ERRORS as error:
+            self.lighting_status_label.setText(str(error))
         else:
             if save_on_success:
-                try:
-                    save_lighting_colors(colors)
-                except LightingAccessError as error:
-                    self.status_label.setText(f"Lighting applied, but {error}")
-                else:
-                    self.status_label.setText(f"Static lighting applied and saved for {zone_names}")
+                self._saved_lighting_colors = dict(colors)
+                self.lighting_status_label.setText(f"Static lighting applied and saved for {zone_names}")
             else:
-                self.status_label.setText(f"Saved lighting reapplied to {zone_names}")
+                self.lighting_status_label.setText(f"Saved lighting restored for {zone_names}")
         self._update_lighting_controls()
 
     def _restore_saved_lighting(self) -> None:
-        if self.demo or self._lighting_pending is not None or not self._lighting_colors:
+        if (
+            self.demo or self._closing or self._lighting_restore_attempted
+            or self._lighting_pending is not None or not self._saved_lighting_colors
+        ):
             return
-        colors = dict(self._lighting_colors)
+        self._lighting_restore_attempted = True
+        colors = dict(self._saved_lighting_colors)
         zone_names = ", ".join(zone.label for zone in colors)
-        self.status_label.setText(f"Reapplying saved lighting to {zone_names}...")
+        self.lighting_status_label.setText(f"Restoring saved lighting for {zone_names}...")
         self._lighting_pending = self.lighting_executor.submit(apply_static_lighting, colors)
         self._update_lighting_controls()
         self._watch_lighting_future(self._lighting_pending, colors, zone_names, save_on_success=False)
 
     def _update_lighting_controls(self) -> None:
-        swatches_enabled = not self.demo and not self._closing and self._lighting_pending is None
+        swatches_enabled = not self._closing and self._lighting_pending is None
         self.all_lighting_button.setEnabled(swatches_enabled)
         for swatch in self._lighting_swatches.values():
             swatch.setEnabled(swatches_enabled)
@@ -795,11 +465,13 @@ class FanControlApp(QMainWindow):
     def _open_session(self) -> None:
         if self._pending is not None or self._closing:
             return
+        self._poll_timer.stop()
+        self._set_controls_enabled(False)
         if not self.demo and not self._platform_security_allows_ec_access():
             return
-        self._set_controls_enabled(False)
         self.retry_button.setEnabled(False)
         self.connection_label.setText("CONNECTING")
+        self.status_label.setStyleSheet("")
         self.status_label.setText("Opening the verified EC transport...")
         self._pending = self.executor.submit(self.session.open)
         self._watch_future(self._pending, self._session_opened)
@@ -827,26 +499,28 @@ class FanControlApp(QMainWindow):
         if security.lockdown_mode not in {None, "none"}:
             detected.append(f"kernel lockdown is in {security.lockdown_mode!r} mode")
         reason = " and ".join(detected)
-        self.connection_label.setText("SECURE BOOT ENABLED")
+        self.connection_label.setText("EC ACCESS BLOCKED")
         self.status_label.setText(f"{reason.capitalize()}; EC access is disabled.")
+        guidance = (
+            "Secure Boot can be disabled in UEFI/BIOS setup (commonly F2 at startup): "
+            "open Security or Boot, set Secure Boot to Disabled, then save and reboot.\n\n"
+            "Disabling Secure Boot reduces boot protection. Have any disk-encryption recovery keys "
+            "available before changing firmware settings."
+            if security.secure_boot_enabled else
+            "Kernel lockdown can also be enabled independently of Secure Boot. "
+            "Review your distribution's kernel and boot policy; the app cannot bypass it."
+        )
         QMessageBox.critical(
             self,
-            "Secure Boot must be disabled",
+            "EC access blocked",
             f"{reason.capitalize()}. This blocks the direct EC writes required by the application.\n\n"
-            "To disable it:\n"
-            "1. Restart the laptop and enter UEFI/BIOS setup using the key shown during startup "
-            "(commonly F2).\n"
-            "2. Open the Security or Boot settings.\n"
-            "3. Set Secure Boot to Disabled.\n"
-            "4. Save the changes, exit setup, and boot Linux again.\n\n"
-            "Disk encryption or another operating system may request a recovery key after this change. "
-            "Make sure any required recovery key is available before changing firmware settings.",
+            f"{guidance}\n\nUse --demo to explore the app without changing your system configuration.",
         )
         self.retry_button.setEnabled(True)
         return False
 
     def _watch_future(self, future: Future[FanStatus], callback: Callable[[Future[FanStatus]], None]) -> None:
-        if self._closing:
+        if self._closing or future is not self._pending:
             return
         if future.done():
             self._pending = None
@@ -857,23 +531,23 @@ class FanControlApp(QMainWindow):
     def _session_opened(self, future: Future[FanStatus]) -> None:
         try:
             status = future.result()
-        except Exception as error:
-            self.connection_label.setText("OFFLINE")
-            self.status_label.setText(str(error))
-            self.retry_button.setEnabled(True)
+        except SESSION_ERRORS as error:
+            self._connection_failed(str(error))
             return
         self.connection_label.setText("DEMO DATA" if self.demo else "EC CONNECTED")
         self.retry_button.setEnabled(False)
-        self._set_controls_enabled(True)
         self._apply_status(status)
-        if self._lighting_load_error is not None:
-            self.status_label.setText(self._lighting_load_error)
-        else:
+        self._set_controls_enabled(True)
+        self.status_label.setText(
+            "Demo mode: hardware and saved settings are untouched." if self.demo else
+            "Connected. Closing the app leaves the firmware in its last selected state."
+        )
+        if self._lighting_load_error is None:
             self._restore_saved_lighting()
         self._schedule_poll()
 
     def _schedule_poll(self) -> None:
-        if not self._closing:
+        if not self._closing and self._current_status is not None:
             self._poll_timer.start()
 
     def _request_status(self) -> None:
@@ -886,15 +560,33 @@ class FanControlApp(QMainWindow):
     def _status_received(self, future: Future[FanStatus]) -> None:
         try:
             self._apply_status(future.result())
-        except Exception as error:
-            self.connection_label.setText("READ ERROR")
-            self.status_label.setText(str(error))
+        except SESSION_ERRORS as error:
+            self._connection_failed(f"Telemetry unavailable: {error}")
+            return
+        self._set_controls_enabled(True)
         self._schedule_poll()
 
+    def _connection_failed(self, message: str) -> None:
+        self._poll_timer.stop()
+        self._current_status = None
+        self._change_in_progress = False
+        self._set_controls_enabled(False)
+        self.connection_label.setText("OFFLINE")
+        self.status_label.setStyleSheet(f"color: {ERROR};")
+        self.status_label.setText(f"{message} Retry the connection before making further changes.")
+        self.profile_badge.setText("UNAVAILABLE")
+        self.power_label.setText("Power supply: unknown")
+        for label in (self.cpu_rpm_label, self.gpu_rpm_label, self.cpu_temp_label, self.gpu_temp_label):
+            label.setText("--")
+        self.retry_button.setEnabled(True)
+        self.graph.update()
+
     def _request_profile_change(self, profile: Profile) -> None:
-        if self._current_status is None or self._pending is not None:
+        if self._current_status is None or self._change_in_progress or self._closing:
+            self._restore_current_controls()
             return
         previous = self._current_status.profile
+        self._restore_current_controls()
         if profile == previous:
             return
         if profile == Profile.TURBO and not self._current_status.turbo_available:
@@ -907,9 +599,10 @@ class FanControlApp(QMainWindow):
             "Change performance mode",
             f"Set the firmware performance mode to {profile.label.title()}?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
-            self._mode_buttons[previous].setChecked(True)
+            self._restore_current_controls()
             return
         self._submit_change(
             lambda: self.session.set_profile(profile),
@@ -917,44 +610,54 @@ class FanControlApp(QMainWindow):
         )
 
     def _request_full_speed_change(self) -> None:
-        if self._current_status is None or self._pending is not None:
+        if self._current_status is None or self._change_in_progress or self._closing:
+            self._restore_current_controls()
             return
         requested = self.full_speed_check.isChecked()
-        previous = self._current_status.full_speed
+        self._restore_current_controls()
         action = "enable" if requested else "disable"
         answer = QMessageBox.question(
             self,
             "Change full-speed override",
-            f"{action.title()} the firmware full-speed fan override?",
+            f"{action.title()} the firmware full-speed fan override?\n\n"
+            "Closing the app leaves this setting unchanged.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
-            self.full_speed_check.setChecked(previous)
+            self._restore_current_controls()
             return
         self._submit_change(
             lambda: self.session.set_full_speed(requested),
-            f"{action.title()}ing full-speed override...",
+            "Enabling full-speed override..." if requested else "Disabling full-speed override...",
         )
 
     def _submit_change(self, operation: Callable[[], FanStatus], status_text: str) -> None:
         self._poll_timer.stop()
+        self._change_in_progress = True
         self._set_controls_enabled(False)
+        self.status_label.setStyleSheet("")
         self.status_label.setText(status_text)
         self._pending = self.executor.submit(operation)
         self._watch_future(self._pending, self._change_completed)
 
     def _change_completed(self, future: Future[FanStatus]) -> None:
+        self._change_in_progress = False
         try:
             status = future.result()
         except InsufficientPowerError as error:
             self.status_label.setText(str(error))
             QMessageBox.warning(self, "Turbo mode unavailable", str(error))
+            if self._current_status is not None:
+                self._current_status = replace(self._current_status, turbo_available=False)
+                self._update_power_status()
             self._restore_current_controls()
-        except Exception as error:
-            self.status_label.setText(str(error))
-            self._restore_current_controls()
+        except SESSION_ERRORS as error:
+            self._connection_failed(f"Change could not be confirmed: {error}")
+            return
         else:
             self._apply_status(status)
+            self.status_label.setText("Demo setting updated." if self.demo else "Firmware change confirmed.")
         self._set_controls_enabled(True)
         self._schedule_poll()
 
@@ -975,12 +678,26 @@ class FanControlApp(QMainWindow):
         override = " / FULL SPEED" if status.full_speed else ""
         self.profile_badge.setText(f"{status.profile.label.upper()}{override}")
         self.connection_label.setText("DEMO DATA" if self.demo else "EC CONNECTED")
-        self.status_label.setText("Firmware telemetry updated" if status.turbo_available else TURBO_POWER_MESSAGE)
+        self._update_power_status()
         self.graph.update()
 
+    def _update_power_status(self) -> None:
+        if self._current_status is not None:
+            self.power_label.setText(
+                "Power supply: simulated" if self.demo else
+                "AC barrel adapter connected" if self._current_status.turbo_available else
+                "Turbo requires the AC barrel adapter; USB-C PD is insufficient."
+            )
+
     def _set_controls_enabled(self, enabled: bool) -> None:
-        for button in self._mode_buttons.values():
-            button.setEnabled(enabled)
+        for profile, button in self._mode_buttons.items():
+            turbo_blocked = (
+                profile == Profile.TURBO
+                and self._current_status is not None
+                and not self._current_status.turbo_available
+            )
+            button.setEnabled(enabled and not turbo_blocked)
+            button.setToolTip(TURBO_POWER_MESSAGE if turbo_blocked else f"Select {profile.label.title()} mode")
         self.full_speed_check.setEnabled(enabled)
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -989,27 +706,21 @@ class FanControlApp(QMainWindow):
             return
         self._closing = True
         self._poll_timer.stop()
-        self.executor.submit(self.session.close)
+        self._set_controls_enabled(False)
+        self._update_lighting_controls()
+        for pending in (self._pending, self._lighting_pending):
+            if pending is not None:
+                pending.add_done_callback(self._log_shutdown_error)
+        self.executor.submit(self.session.close).add_done_callback(self._log_shutdown_error)
         self.executor.shutdown(wait=False, cancel_futures=False)
         self.lighting_executor.shutdown(wait=False, cancel_futures=False)
         event.accept()
 
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Medion Major X10 fan-control GUI")
-    parser.add_argument("--demo", action="store_true", help="show simulated telemetry without hardware access")
-    return parser.parse_args(argv)
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    application = QApplication(sys.argv[:1])
-    application.setApplicationName("Medion Major X10 Control")
-    application.setOrganizationName("Medion Fan Control")
-    window = FanControlApp(demo=args.demo)
-    window.show()
-    return application.exec()
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    @staticmethod
+    def _log_shutdown_error(future: Future[FanStatus] | Future[None]) -> None:
+        error = future.exception()
+        if error is not None:
+            logger.error(
+                "Hardware operation failed during shutdown: %s", error,
+                exc_info=(type(error), error, error.__traceback__),
+            )

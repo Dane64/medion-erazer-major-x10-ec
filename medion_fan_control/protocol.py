@@ -81,8 +81,10 @@ class EcProtocol:
     ) -> None:
         if retries < 1:
             raise ValueError("retries must be at least 1")
+        if io_delay < 0 or profile_settle_delay < 0:
+            raise ValueError("protocol delays cannot be negative")
         self._port_io = port_io
-        self._turbo_power_available = turbo_power_available or (lambda: True)
+        self._turbo_power_available = turbo_power_available or (lambda: False)
         self._sleep = sleep
         self._retries = retries
         self._io_delay = io_delay
@@ -122,10 +124,10 @@ class EcProtocol:
 
     def set_profile(self, profile: Profile) -> Profile:
         requested = Profile(profile)
-        if requested == Profile.TURBO and not self.is_turbo_available():
-            raise InsufficientPowerError(TURBO_POWER_MESSAGE)
         last_value = -1
         for _ in range(self._retries):
+            if requested == Profile.TURBO and not self.is_turbo_available():
+                raise InsufficientPowerError(TURBO_POWER_MESSAGE)
             self._send_value(self.COMMAND_CONTROL, requested.value)
             self._sleep(self._profile_settle_delay)
             last_value = self._read_index(self.COMMAND_CONTROL, self.INDEX_PROFILE)

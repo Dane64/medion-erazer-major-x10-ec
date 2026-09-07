@@ -95,8 +95,8 @@ def require_ec_writes_unlocked() -> PlatformSecurityStatus:
     status = read_platform_security()
     if status.blocks_ec_access:
         raise PlatformSecurityError(
-            "Secure Boot or kernel lockdown is active; disable Secure Boot in UEFI firmware "
-            "and reboot before accessing the embedded controller"
+            "Secure Boot or kernel lockdown is active; EC access is blocked. "
+            "Use demo mode or review the Secure Boot and kernel lockdown configuration."
         )
     return status
 
@@ -155,6 +155,8 @@ class DevPortIO:
         self._lock_fd: int | None = None
 
     def __enter__(self) -> DevPortIO:
+        if self._port_fd is not None or self._lock_fd is not None:
+            raise HardwareAccessError("port device is already open")
         try:
             self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -174,12 +176,14 @@ class DevPortIO:
         self.close()
 
     def close(self) -> None:
-        if self._port_fd is not None:
-            os.close(self._port_fd)
-            self._port_fd = None
-        if self._lock_fd is not None:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        port_fd, self._port_fd = self._port_fd, None
+        lock_fd, self._lock_fd = self._lock_fd, None
+        try:
+            if port_fd is not None:
+                os.close(port_fd)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
 
     def read_byte(self, port: int) -> int:
         if self._port_fd is None:

@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  QT_QPA_PLATFORM: offscreen
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.12.6"
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked
+
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends libegl1 libgl1 libopengl0 libxkbcommon0
+
+      - name: Run hardware-isolated tests
+        run: uv run --no-sync python -m unittest discover -s tests -v
+
+  package:
+    name: Package
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+        with:
+          version: "0.12.6"
+          python-version: "3.13"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install locked build dependencies
+        run: uv sync --locked --group build
+
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends libegl1 libgl1 libopengl0 libxkbcommon0
+
+      - name: Build sdist and wheel with locked tooling
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          uv build --no-build-isolation
+
+      - name: Validate distributions and generate checksums
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            uv run --no-sync python tools/release.py check dist --tag "$GITHUB_REF_NAME"
+          else
+            uv run --no-sync python tools/release.py check dist
+          fi
+
+      - name: Test installed wheel outside the checkout
+        run: |
+          smoke="$RUNNER_TEMP/package-smoke"
+          uv venv --python 3.13 "$smoke"
+          uv export --locked --no-dev --no-emit-project --output-file "$RUNNER_TEMP/runtime-requirements.txt"
+          uv pip sync --python "$smoke/bin/python" --require-hashes "$RUNNER_TEMP/runtime-requirements.txt"
+          uv pip install --python "$smoke/bin/python" --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$smoke/bin/medion-fan-control" --help
+          "$smoke/bin/medion-fan-control" --version
+          "$smoke/bin/python" -I -m medion_fan_control --version
+          "$smoke/bin/python" -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -p test_gui.py -v
+
+      - name: Upload validated distributions
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: dist-${{ github.sha }}
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  quality:
+    name: Quality gate
+    if: always()
+    needs: [test, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require successful tests and packaging
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: test "$TEST_RESULT" = success && test "$PACKAGE_RESULT" = success
