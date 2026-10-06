@@ -18,6 +18,10 @@ class HardwareAccessError(RuntimeError):
     pass
 
 
+class PlatformSecurityError(HardwareAccessError):
+    pass
+
+
 @dataclass(frozen=True)
 class MachineIdentity:
     system_vendor: str
@@ -29,6 +33,16 @@ class MachineIdentity:
     ec_firmware_release: str
 
 
+@dataclass(frozen=True)
+class PlatformSecurityStatus:
+    secure_boot_enabled: bool | None
+    lockdown_mode: str | None
+
+    @property
+    def blocks_ec_access(self) -> bool:
+        return self.secure_boot_enabled is True or self.lockdown_mode not in {None, "none"}
+
+
 SUPPORTED_IDENTITY = MachineIdentity(
     system_vendor="MEDION",
     product_name="Major X10",
@@ -38,6 +52,53 @@ SUPPORTED_IDENTITY = MachineIdentity(
     bios_version="M1IB008",
     ec_firmware_release="0.8",
 )
+
+SECURE_BOOT_EFIVAR = "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+
+
+def read_platform_security(
+    efivars_root: Path = Path("/sys/firmware/efi/efivars"),
+    lockdown_path: Path = Path("/sys/kernel/security/lockdown"),
+) -> PlatformSecurityStatus:
+    secure_boot_path = efivars_root / SECURE_BOOT_EFIVAR
+    try:
+        secure_boot_data = secure_boot_path.read_bytes()
+    except FileNotFoundError:
+        secure_boot_enabled = None
+    except OSError as error:
+        raise HardwareAccessError(f"cannot read Secure Boot state: {error}") from error
+    else:
+        if len(secure_boot_data) < 5 or secure_boot_data[4] not in {0, 1}:
+            raise HardwareAccessError("Secure Boot firmware variable has an invalid value")
+        secure_boot_enabled = secure_boot_data[4] == 1
+
+    try:
+        lockdown_text = lockdown_path.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        lockdown_mode = None
+    except (OSError, UnicodeError) as error:
+        raise HardwareAccessError(f"cannot read kernel lockdown state: {error}") from error
+    else:
+        selected_modes = [
+            token[1:-1]
+            for token in lockdown_text.split()
+            if token.startswith("[") and token.endswith("]")
+        ]
+        if len(selected_modes) != 1 or selected_modes[0] not in {"none", "integrity", "confidentiality"}:
+            raise HardwareAccessError(f"invalid kernel lockdown state: {lockdown_text!r}")
+        lockdown_mode = selected_modes[0]
+
+    return PlatformSecurityStatus(secure_boot_enabled, lockdown_mode)
+
+
+def require_ec_writes_unlocked() -> PlatformSecurityStatus:
+    status = read_platform_security()
+    if status.blocks_ec_access:
+        raise PlatformSecurityError(
+            "Secure Boot or kernel lockdown is active; EC access is blocked. "
+            "Use demo mode or review the Secure Boot and kernel lockdown configuration."
+        )
+    return status
 
 
 def read_ac0_online(power_supply_root: Path = Path("/sys/class/power_supply")) -> bool:
@@ -94,6 +155,8 @@ class DevPortIO:
         self._lock_fd: int | None = None
 
     def __enter__(self) -> DevPortIO:
+        if self._port_fd is not None or self._lock_fd is not None:
+            raise HardwareAccessError("port device is already open")
         try:
             self._lock_fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -113,12 +176,14 @@ class DevPortIO:
         self.close()
 
     def close(self) -> None:
-        if self._port_fd is not None:
-            os.close(self._port_fd)
-            self._port_fd = None
-        if self._lock_fd is not None:
-            os.close(self._lock_fd)
-            self._lock_fd = None
+        port_fd, self._port_fd = self._port_fd, None
+        lock_fd, self._lock_fd = self._lock_fd, None
+        try:
+            if port_fd is not None:
+                os.close(port_fd)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
 
     def read_byte(self, port: int) -> int:
         if self._port_fd is None:
@@ -140,6 +205,7 @@ class DevPortIO:
 
 @contextmanager
 def open_supported_protocol() -> Iterator[EcProtocol]:
+    require_ec_writes_unlocked()
     require_supported_machine(read_machine_identity())
     with DevPortIO() as port_io:
         yield EcProtocol(port_io, turbo_power_available=read_ac0_online)

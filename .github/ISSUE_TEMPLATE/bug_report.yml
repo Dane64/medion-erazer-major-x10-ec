@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible application or installation problem.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach firmware binaries, serial numbers, full DMI dumps, or unreviewed logs.
+        Use demo mode where possible; do not probe unsupported hardware.
+  - type: input
+    id: version
+    attributes:
+      label: Application version
+      description: Output of medion-fan-control --version, or the source commit.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, Python version, and X11 or Wayland session.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Application mode
+      options:
+        - Demo
+        - Supported hardware
+        - Installation or startup
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the expected behavior and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Error message
+      description: Paste the relevant message only, with private information removed.
+      render: text

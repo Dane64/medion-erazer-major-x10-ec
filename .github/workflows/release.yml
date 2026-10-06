@@ -1,0 +1,108 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a version tag on the default branch
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if ! git merge-base --is-ancestor HEAD "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Release tags must point to a commit on the default branch."
+            exit 1
+          fi
+          python3 tools/release.py tag "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  checks:
+    name: Release checks
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish release
+    needs: [validate, checks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: dist-${{ github.sha }}
+          path: dist
+
+      - name: Verify and publish release assets
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          PRERELEASE: ${{ needs.validate.outputs.prerelease }}
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          remote_sha="$(gh api "repos/$GH_REPO/commits/$RELEASE_TAG" --jq .sha)"
+          if [[ "$remote_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::The release tag moved after validation."
+            exit 1
+          fi
+
+          draft="$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | .draft")"
+          if [[ "$draft" == "false" ]]; then
+            echo "::error::This release is already published. Published assets are never overwritten."
+            exit 1
+          fi
+          if [[ -z "$draft" ]]; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --title "$RELEASE_TAG" --generate-notes --prerelease="$PRERELEASE"
+          elif [[ "$draft" != "true" ]]; then
+            echo "::error::Unexpected release state."
+            exit 1
+          fi
+
+          gh release upload "$RELEASE_TAG" --clobber \
+            "medion_erazer_major_x10_ec-$VERSION-py3-none-any.whl" \
+            "medion_erazer_major_x10_ec-$VERSION.tar.gz" SHA256SUMS
+          expected_assets="$(printf '%s\n' \
+            "medion_erazer_major_x10_ec-$VERSION-py3-none-any.whl" \
+            "medion_erazer_major_x10_ec-$VERSION.tar.gz" SHA256SUMS | sort)"
+          actual_assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+          if [[ "$actual_assets" != "$expected_assets" ]]; then
+            echo "::error::Draft assets do not match the validated distributions."
+            exit 1
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease="$PRERELEASE"
