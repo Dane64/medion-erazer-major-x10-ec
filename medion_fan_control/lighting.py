@@ -187,3 +187,66 @@ def apply_static_lighting(colors: Mapping[LightZone, RgbColor]) -> None:
     require_supported_machine(read_machine_identity())
     with HidLighting() as lighting:
         lighting.set_static_colors(colors)
+
+
+OFF = RgbColor(0, 0, 0)
+
+
+@dataclass(frozen=True)
+class ZoneSetting:
+    """A zone's chosen color plus an on/off switch.
+
+    Switching a zone off sends black (R=G=B=0): with no LED current the zone
+    is physically dark, and this needs no unverified firmware command. The
+    chosen color is kept so switching on restores it.
+    """
+
+    color: RgbColor
+    on: bool = True
+
+
+def effective_color(setting: ZoneSetting, brightness_percent: int = 100) -> RgbColor:
+    if not 0 <= brightness_percent <= 100:
+        raise ValueError("brightness must be between 0 and 100 %")
+    if not setting.on or brightness_percent == 0:
+        return OFF
+    scale = brightness_percent / 100
+    color = setting.color
+    return RgbColor(*(round(component * scale) for component in (color.red, color.green, color.blue)))
+
+
+def resolve_lighting(
+    settings: Mapping[LightZone, ZoneSetting], brightness_percent: int = 100,
+) -> dict[LightZone, RgbColor]:
+    return {LightZone(zone): effective_color(setting, brightness_percent) for zone, setting in settings.items()}
+
+
+def lighting_to_document(settings: Mapping[LightZone, ZoneSetting], brightness_percent: int) -> dict:
+    return {
+        "brightness": brightness_percent,
+        "zones": {
+            zone.name.lower(): {"color": setting.color.hex, "on": setting.on}
+            for zone, setting in sorted(settings.items(), key=lambda item: item[0].value)
+        },
+    }
+
+
+def lighting_from_document(document: object) -> tuple[dict[LightZone, ZoneSetting], int]:
+    if not isinstance(document, dict) or not isinstance(document.get("zones"), dict):
+        raise ValueError("lighting document must contain a zones mapping")
+    brightness = document.get("brightness", 100)
+    if isinstance(brightness, bool) or not isinstance(brightness, int) or not 0 <= brightness <= 100:
+        raise ValueError("brightness must be an integer between 0 and 100")
+    settings: dict[LightZone, ZoneSetting] = {}
+    for name, entry in document["zones"].items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            raise ValueError("invalid zone entry")
+        try:
+            zone = LightZone[name.upper()]
+        except KeyError as error:
+            raise ValueError(f"unknown lighting zone {name!r}") from error
+        on = entry.get("on", True)
+        if not isinstance(on, bool):
+            raise ValueError("zone 'on' must be true or false")
+        settings[zone] = ZoneSetting(RgbColor.from_hex(entry.get("color")), on)
+    return settings, brightness

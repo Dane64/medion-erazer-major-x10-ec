@@ -1,0 +1,7 @@
+The kernel module in this directory (x10_ec.c, Makefile, dkms.conf) is
+licensed under the GNU General Public License, version 2 only
+(SPDX-License-Identifier: GPL-2.0-only), because it links against the Linux
+kernel. The full license text is available at
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+Everything outside this directory remains under the Apache License 2.0.

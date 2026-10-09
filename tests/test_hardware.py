@@ -19,6 +19,7 @@ from medion_fan_control.hardware import (
     open_supported_protocol,
     require_ec_writes_unlocked,
     require_supported_machine,
+    select_ec_device,
 )
 
 
@@ -167,20 +168,43 @@ class HardwareTests(unittest.TestCase):
                     with self.assertRaises(HardwareAccessError):
                         read_ac0_online(root)
 
-    def test_platform_guard_runs_before_identity_and_device_access(self):
+    def test_locked_down_without_module_is_blocked_before_identity_and_device_access(self):
         with (
+            tempfile.TemporaryDirectory() as directory,
             patch("medion_fan_control.hardware.read_platform_security", return_value=PlatformSecurityStatus(True, "integrity")),
             patch("medion_fan_control.hardware.read_machine_identity") as identity,
             patch("medion_fan_control.hardware.DevPortIO") as device,
         ):
-            with self.assertRaises(PlatformSecurityError), open_supported_protocol():
+            missing = Path(directory) / "x10-ec"
+            with self.assertRaisesRegex(PlatformSecurityError, "x10_ec module"), open_supported_protocol(missing):
                 self.fail("blocked hardware session opened")
             identity.assert_not_called()
             device.assert_not_called()
 
+    def test_signed_module_is_used_even_with_secure_boot(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("medion_fan_control.hardware.read_platform_security", return_value=PlatformSecurityStatus(True, "integrity")),
+            patch("medion_fan_control.hardware.read_machine_identity", return_value=SUPPORTED_IDENTITY),
+            patch("medion_fan_control.hardware.DevPortIO") as device,
+        ):
+            module = Path(directory) / "x10-ec"
+            module.write_bytes(b"")
+            self.assertEqual(select_ec_device(module), module)
+            with open_supported_protocol(module):
+                pass
+            device.assert_called_once_with(port_path=module)
+
+    def test_legacy_port_only_without_lockdown(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("medion_fan_control.hardware.read_platform_security", return_value=PlatformSecurityStatus(False, "none")),
+        ):
+            self.assertEqual(select_ec_device(Path(directory) / "missing"), Path("/dev/port"))
+
     def test_identity_guard_runs_before_device_access(self):
         with (
-            patch("medion_fan_control.hardware.require_ec_writes_unlocked"),
+            patch("medion_fan_control.hardware.select_ec_device", return_value=Path("/dev/x10-ec")),
             patch("medion_fan_control.hardware.read_machine_identity", return_value=replace(SUPPORTED_IDENTITY, bios_version="other")),
             patch("medion_fan_control.hardware.DevPortIO") as device,
         ):
@@ -190,7 +214,7 @@ class HardwareTests(unittest.TestCase):
 
     def test_supported_session_wires_live_ac_check_and_closes_transport(self):
         with (
-            patch("medion_fan_control.hardware.require_ec_writes_unlocked"),
+            patch("medion_fan_control.hardware.select_ec_device", return_value=Path("/dev/x10-ec")),
             patch("medion_fan_control.hardware.read_machine_identity", return_value=SUPPORTED_IDENTITY),
             patch("medion_fan_control.hardware.DevPortIO") as device,
             patch("medion_fan_control.hardware.read_ac0_online", side_effect=[True, False]) as power,

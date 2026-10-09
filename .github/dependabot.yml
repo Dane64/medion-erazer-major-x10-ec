@@ -4,6 +4,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    labels: [dependencies, ci]
     groups:
       actions:
         patterns: ["*"]
@@ -13,7 +14,14 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    labels: [dependencies]
     groups:
       python-dependencies:
         patterns: ["*"]
     open-pull-requests-limit: 5
+
+  - package-ecosystem: gitsubmodule
+    directory: /
+    schedule:
+      interval: weekly
+    labels: [dependencies, packaging]

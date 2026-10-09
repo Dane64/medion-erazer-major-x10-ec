@@ -8,12 +8,12 @@ from . import __version__
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="medion-fan-control",
-        description="Medion Major X10 fan, profile, telemetry, and lighting control",
+        prog="x10-control",
+        description="Erazer Control: fans, CPU, GPU, display, audio and lighting for the MEDION Erazer Major X10",
     )
     parser.add_argument(
         "--demo", action="store_true",
-        help="preview simulated telemetry and lighting without hardware access or saved settings",
+        help="explore the full interface with simulated hardware; nothing is read, written or saved",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
@@ -22,17 +22,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if sys.platform != "linux":
-        print("Medion Major X10 Control currently supports Linux only.", file=sys.stderr)
+        print("Erazer Control currently supports Linux only.", file=sys.stderr)
         return 1
 
     from PySide6.QtWidgets import QApplication
 
     from .gui import FanControlApp
+    from .icons import app_icon
 
     application = QApplication(sys.argv[:1])
-    application.setApplicationName("Medion Major X10 Control")
+    application.setApplicationName("Erazer Control")
+    application.setDesktopFileName("x10-control")
     application.setApplicationVersion(__version__)
     application.setOrganizationName("Medion Fan Control")
+    application.setWindowIcon(app_icon())
     window = FanControlApp(demo=args.demo)
     window.show()
     return application.exec()

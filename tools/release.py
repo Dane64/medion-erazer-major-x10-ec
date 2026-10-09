@@ -18,13 +18,23 @@ PACKAGE_NAME = "medion_fan_control"
 REQUIRED_MODULES = {
     f"{PACKAGE_NAME}/{name}.py"
     for name in (
-        "__init__", "__main__", "_version", "cli", "controller", "gui",
-        "hardware", "lighting", "protocol", "settings", "telemetry", "theme", "widgets",
+        "__init__", "__main__", "_version", "audio", "cli", "client", "controller", "cpu", "daemon",
+        "display", "gpu", "gui", "hardware", "icons", "lighting", "protocol", "settings", "sysfs",
+        "telemetry", "theme", "widgets",
     )
 }
+REQUIRED_ASSETS = {
+    f"{PACKAGE_NAME}/assets/{name}"
+    for name in ("x10-control.svg", "fonts/Outfit-Variable.ttf", "fonts/OFL.txt")
+}
+REQUIRED_PACKAGE_FILES = REQUIRED_MODULES | REQUIRED_ASSETS
 REQUIRED_SOURCE_FILES = {
-    ".gitignore", "README.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml", "uv.lock",
-    "docs/protocol.md", "docs/user-guide.md", "docs/releases.md", "tools/release.py",
+    ".gitignore", "README.md", "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "pyproject.toml", "uv.lock",
+    "docs/building.md", "docs/protocol.md", "docs/user-guide.md", "docs/releases.md", "docs/secure-boot.md",
+    "tools/release.py", "kernel/x10_ec.c", "kernel/Makefile", "kernel/dkms.conf", "kernel/LICENSE-GPL-2.0.txt",
+    "packaging/systemd/x10ctld.service", "packaging/x10ctld.conf", "packaging/desktop/x10-control.desktop",
+    "scripts/install.sh", "scripts/mok-sign.sh", "scripts/uninstall.sh",
+    "ext/arc-dgpu-ctl/Makefile", "ext/arc-dgpu-ctl/VERSION", "ext/arc-dgpu-ctl/src/arc-dgpu-ctl",
 }
 TAG_PATTERN = re.compile(
     r"v(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
@@ -71,8 +81,8 @@ def check_distributions(directory: Path, tag: str | None = None) -> tuple[Path, 
         validate_paths(paths)
         if len(paths) != len(names):
             raise ValueError("duplicate wheel members")
-        if not REQUIRED_MODULES <= paths:
-            raise ValueError(f"wheel is missing modules: {sorted(REQUIRED_MODULES - paths)}")
+        if not REQUIRED_PACKAGE_FILES <= paths:
+            raise ValueError(f"wheel is missing files: {sorted(REQUIRED_PACKAGE_FILES - paths)}")
         metadata_paths = [name for name in paths if name.endswith(".dist-info/METADATA")]
         if len(metadata_paths) != 1:
             raise ValueError("wheel must contain exactly one METADATA file")
@@ -89,8 +99,11 @@ def check_distributions(directory: Path, tag: str | None = None) -> tuple[Path, 
             raise ValueError("wheel is missing its launcher")
         entry_points = configparser.ConfigParser()
         entry_points.read_string(archive.read(entry_points_path).decode("utf-8"))
-        if entry_points.get("gui_scripts", "medion-fan-control", fallback="") != "medion_fan_control.cli:main":
-            raise ValueError("wheel has an incorrect GUI entry point")
+        for launcher in ("x10-control", "medion-fan-control"):
+            if entry_points.get("gui_scripts", launcher, fallback="") != "medion_fan_control.cli:main":
+                raise ValueError("wheel has an incorrect GUI entry point")
+        if entry_points.get("console_scripts", "x10ctld", fallback="") != "medion_fan_control.daemon:main":
+            raise ValueError("wheel has an incorrect daemon entry point")
 
     if tag is not None and version != parse_tag(tag)[0]:
         raise ValueError(f"built version {version!r} does not match release tag {tag!r}")
@@ -111,16 +124,19 @@ def check_distributions(directory: Path, tag: str | None = None) -> tuple[Path, 
         if any(not name.startswith(prefix) and name != prefix.rstrip("/") for name in names):
             raise ValueError("source distribution contains files outside its root")
         files = {member.name.removeprefix(prefix) for member in members if member.isfile()}
-        required = REQUIRED_MODULES | REQUIRED_SOURCE_FILES | {"PKG-INFO"}
+        required = REQUIRED_PACKAGE_FILES | REQUIRED_SOURCE_FILES | {"PKG-INFO"}
         if not required <= files:
             raise ValueError(f"source distribution is missing files: {sorted(required - files)}")
         if not any(name.startswith("tests/test_") and name.endswith(".py") for name in files):
             raise ValueError("source distribution is missing its tests")
-        allowed_roots = {PACKAGE_NAME, "tests", "docs", "tools"}
+        allowed_roots = {PACKAGE_NAME, "tests", "docs", "tools", "packaging", "kernel", "ext"}
         unrelated = {
             name for name in files
-            if name not in required and PurePosixPath(name).parts[0] not in allowed_roots
+            if name not in required
+            and PurePosixPath(name).parts[0] not in allowed_roots
+            and not (PurePosixPath(name).parent == PurePosixPath("scripts") and name.endswith(".sh"))
         }
+        unrelated |= {name for name in files if PurePosixPath(name).name == ".git"}
         if unrelated:
             raise ValueError(f"source distribution contains unrelated files: {sorted(unrelated)}")
         metadata_file = archive.extractfile(f"{prefix}PKG-INFO")
@@ -143,6 +159,21 @@ def write_checksums(directory: Path, distributions: tuple[Path, Path]) -> Path:
     return destination
 
 
+def changelog_section(text: str, version: str) -> str:
+    """Body of the `## [version]` section of a Keep a Changelog file, or ''."""
+    body: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = re.match(rf"## \[{re.escape(version)}\](?:\s|$)", line) is not None
+            continue
+        if inside:
+            body.append(line)
+    return "\n".join(body).strip()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -151,11 +182,18 @@ def main(argv: list[str] | None = None) -> int:
     check_parser = commands.add_parser("check", help="validate a wheel and sdist, then write SHA256SUMS")
     check_parser.add_argument("directory", type=Path)
     check_parser.add_argument("--tag", help="require package versions to match this release tag")
+    notes_parser = commands.add_parser("notes", help="print the CHANGELOG.md section for a release tag")
+    notes_parser.add_argument("tag")
+    notes_parser.add_argument("--changelog", type=Path, default=Path("CHANGELOG.md"))
     args = parser.parse_args(argv)
     try:
         if args.command == "tag":
             version, prerelease = parse_tag(args.tag)
             print(f"version={version}\nprerelease={str(prerelease).lower()}")
+        elif args.command == "notes":
+            notes = changelog_section(args.changelog.read_text(encoding="utf-8"), parse_tag(args.tag)[0])
+            if notes:
+                print(notes)
         else:
             distributions = check_distributions(args.directory, args.tag)
             write_checksums(args.directory, distributions)

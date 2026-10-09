@@ -176,5 +176,39 @@ class LightingTests(unittest.TestCase):
             transport.return_value.__exit__.assert_called_once()
 
 
+class ZoneSettingTests(unittest.TestCase):
+    def test_off_zone_sends_black_and_keeps_its_color(self):
+        from medion_fan_control.lighting import OFF, ZoneSetting, effective_color, resolve_lighting
+
+        setting = ZoneSetting(RgbColor(10, 20, 30), on=False)
+        self.assertEqual(effective_color(setting), OFF)
+        self.assertEqual(setting.color, RgbColor(10, 20, 30))
+        resolved = resolve_lighting({LightZone.LID: setting, LightZone.KEYBOARD: ZoneSetting(RgbColor(200, 100, 50))}, 50)
+        self.assertEqual(resolved[LightZone.LID], OFF)
+        self.assertEqual(resolved[LightZone.KEYBOARD], RgbColor(100, 50, 25))
+        report = build_static_color_report(LightZone.LID, resolved[LightZone.LID])
+        self.assertEqual(report[9:12], b"\x00\x00\x00")
+
+    def test_zero_brightness_switches_everything_off(self):
+        from medion_fan_control.lighting import OFF, ZoneSetting, effective_color
+
+        self.assertEqual(effective_color(ZoneSetting(RgbColor(255, 255, 255)), 0), OFF)
+        with self.assertRaises(ValueError):
+            effective_color(ZoneSetting(RgbColor(1, 1, 1)), 101)
+
+    def test_document_round_trip_and_validation(self):
+        from medion_fan_control.lighting import ZoneSetting, lighting_from_document, lighting_to_document
+
+        settings = {LightZone.KEYBOARD: ZoneSetting(RgbColor(1, 2, 3), False)}
+        document = lighting_to_document(settings, 40)
+        self.assertEqual(document, {"brightness": 40, "zones": {"keyboard": {"color": "#010203", "on": False}}})
+        self.assertEqual(lighting_from_document(document), (settings, 40))
+        for bad in (None, {}, {"zones": {"nope": {"color": "#000000"}}},
+                    {"zones": {"keyboard": {"color": "#000000", "on": "yes"}}},
+                    {"zones": {}, "brightness": 150}, {"zones": {"keyboard": {"color": "blue"}}}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                lighting_from_document(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

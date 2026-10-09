@@ -1,0 +1,11 @@
+# Categories for GitHub-generated release notes (fallback when CHANGELOG.md has no section)
+changelog:
+  exclude:
+    labels: [duplicate, wontfix, invalid]
+  categories:
+    - { title: Breaking changes,   labels: [breaking-change] }
+    - { title: Features,           labels: [enhancement, gui, daemon, lighting] }
+    - { title: Fixes,              labels: [bug, kernel] }
+    - { title: Documentation,      labels: [documentation] }
+    - { title: Packaging and CI,   labels: [packaging, ci, dependencies] }
+    - { title: Other,              labels: ["*"] }

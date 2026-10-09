@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 import time
 
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPaintEvent, QPen, QResizeEvent
-from PySide6.QtWidgets import QGridLayout, QSizePolicy, QWidget
+from PySide6.QtWidgets import QCheckBox, QGridLayout, QSizePolicy, QWidget
 
 from .telemetry import TelemetryHistory, TelemetrySample, format_duration
-from .theme import CPU_COLOR, GPU_COLOR, GRID, INK, MUTED, SURFACE
+from .theme import (
+    ACCENT, ACCENT_HI, BORDER, BRAND_FONT, CPU_COLOR, GPU_COLOR, GRID, INK, MUTED, SURFACE, SURFACE_HI,
+)
 
 
 class ResponsiveGrid(QWidget):
@@ -97,10 +99,10 @@ class TelemetryGraph(QWidget):
         )
         temperature_max = max(100, math.ceil(maximum_temperature / 20) * 20)
 
-        painter.setFont(QFont("DejaVu Sans", 8))
+        painter.setFont(QFont(BRAND_FONT, 8))
         painter.setPen(QColor(MUTED))
         painter.drawText(0, 0, 54, 18, Qt.AlignmentFlag.AlignRight, "RPM")
-        painter.drawText(int(right + 10), 0, 42, 18, Qt.AlignmentFlag.AlignLeft, "C")
+        painter.drawText(int(right + 10), 0, 42, 18, Qt.AlignmentFlag.AlignLeft, "°C")
         for step in range(5):
             fraction = step / 4
             y = bottom - fraction * (bottom - top)
@@ -126,14 +128,14 @@ class TelemetryGraph(QWidget):
             label = "NOW" if age == 0 else f"-{format_duration(age)}"
             painter.drawText(int(x - 40), int(bottom + 8), 80, 20, Qt.AlignmentFlag.AlignCenter, label)
 
-        painter.setPen(QPen(QColor(INK), 2))
+        painter.setPen(QPen(QColor(MUTED), 1))
         painter.drawLine(QPointF(left, top), QPointF(left, bottom))
         painter.drawLine(QPointF(left, bottom), QPointF(right, bottom))
         painter.drawLine(QPointF(right, top), QPointF(right, bottom))
 
         if not samples:
             painter.setPen(QColor(MUTED))
-            painter.setFont(QFont("DejaVu Sans", 10, QFont.Weight.Bold))
+            painter.setFont(QFont(BRAND_FONT, 10, QFont.Weight.Bold))
             painter.drawText(
                 int(left), int(top), int(right - left), int(bottom - top),
                 Qt.AlignmentFlag.AlignCenter, "WAITING FOR TELEMETRY",
@@ -185,8 +187,109 @@ class TelemetryGraph(QWidget):
         if dashed:
             pen.setStyle(Qt.PenStyle.DashLine)
         painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawPath(path)
         if last_point is not None:
             painter.setBrush(QColor(color))
             painter.setPen(QPen(QColor(SURFACE), 1))
             painter.drawEllipse(last_point, 4, 4)
+
+
+class ValueSlider(QWidget):
+    """Slider with a caption and a live value readout."""
+
+    def __init__(
+        self,
+        caption: str,
+        minimum: int,
+        maximum: int,
+        value: int,
+        *,
+        unit: str = "",
+        step: int = 1,
+        formatter=None,
+        parent: QWidget | None = None,
+    ) -> None:
+        from PySide6.QtWidgets import QHBoxLayout, QLabel, QSlider
+
+        super().__init__(parent)
+        self._step = max(1, step)
+        self._unit = unit
+        self._formatter = formatter or (lambda v: f"{v:,}{(' ' + unit) if unit else ''}")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.caption = QLabel(caption)
+        self.caption.setMinimumWidth(150)
+        layout.addWidget(self.caption)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(minimum // self._step, maximum // self._step)
+        self.slider.setValue(value // self._step)
+        self.slider.setAccessibleName(caption)
+        layout.addWidget(self.slider, 1)
+        self.readout = QLabel()
+        self.readout.setMinimumWidth(90)
+        self.readout.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.readout.setObjectName("metricName")
+        layout.addWidget(self.readout)
+        self.slider.valueChanged.connect(self._update)
+        self._update()
+
+    def _update(self) -> None:
+        self.readout.setText(self._formatter(self.value()))
+
+    def value(self) -> int:
+        return self.slider.value() * self._step
+
+    def setValue(self, value: int) -> None:  # noqa: N802 - Qt naming
+        self.slider.setValue(value // self._step)
+
+
+class ToggleSwitch(QCheckBox):
+    """On/off switch with a sliding knob, drawn in the Erazer palette."""
+
+    TRACK_W, TRACK_H = 38, 20
+
+    def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        text_width = self.fontMetrics().horizontalAdvance(self.text()) + 10 if self.text() else 0
+        return QSize(self.TRACK_W + 4 + text_width, max(self.TRACK_H + 4, self.fontMetrics().height() + 4))
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.sizeHint()
+
+    def hitButton(self, pos) -> bool:  # noqa: N802
+        return self.rect().contains(pos)
+
+    def paintEvent(self, _event: QPaintEvent) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        top = (self.height() - self.TRACK_H) / 2
+        track = QRectF(2, top, self.TRACK_W, self.TRACK_H)
+        enabled = self.isEnabled()
+        on = self.isChecked()
+        track_color = QColor(ACCENT if on else BORDER)
+        if not enabled:
+            track_color = QColor("#26324a" if on else SURFACE_HI)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(track_color)
+        painter.drawRoundedRect(track, self.TRACK_H / 2, self.TRACK_H / 2)
+        knob = self.TRACK_H - 6
+        x = track.right() - knob - 3 if on else track.left() + 3
+        painter.setBrush(QColor(INK if enabled else MUTED))
+        painter.drawEllipse(QRectF(x, top + 3, knob, knob))
+        if self.hasFocus():
+            painter.setPen(QPen(QColor(ACCENT_HI), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(track.adjusted(-1, -1, 1, 1), self.TRACK_H / 2, self.TRACK_H / 2)
+        if self.text():
+            painter.setPen(QColor(INK if enabled else MUTED))
+            font = painter.font()
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(
+                QRectF(track.right() + 10, 0, self.width() - track.right() - 10, self.height()),
+                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), self.text(),
+            )

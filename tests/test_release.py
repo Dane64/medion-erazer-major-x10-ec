@@ -10,8 +10,9 @@ from pathlib import Path
 from tools.release import (
     ARCHIVE_NAME,
     PROJECT_NAME,
-    REQUIRED_MODULES,
+    REQUIRED_PACKAGE_FILES,
     REQUIRED_SOURCE_FILES,
+    changelog_section,
     check_distributions,
     main,
     parse_tag,
@@ -49,13 +50,17 @@ class DistributionTests(unittest.TestCase):
         self.wheel = self.root / f"{ARCHIVE_NAME}-{self.version}-py3-none-any.whl"
         self.sdist = self.root / f"{ARCHIVE_NAME}-{self.version}.tar.gz"
         metadata = f"Metadata-Version: 2.4\nName: {PROJECT_NAME}\nVersion: {self.version}\n\n".encode()
-        self.wheel_files = dict.fromkeys(REQUIRED_MODULES, b"# package fixture\n")
+        self.wheel_files = dict.fromkeys(REQUIRED_PACKAGE_FILES, b"# package fixture\n")
         self.wheel_files.update({
             f"{self.dist_info}/METADATA": metadata,
             f"{self.dist_info}/licenses/LICENSE": b"license fixture\n",
-            f"{self.dist_info}/entry_points.txt": b"[gui_scripts]\nmedion-fan-control = medion_fan_control.cli:main\n",
+            f"{self.dist_info}/entry_points.txt": (
+                b"[console_scripts]\nx10ctld = medion_fan_control.daemon:main\n"
+                b"[gui_scripts]\nmedion-fan-control = medion_fan_control.cli:main\n"
+                b"x10-control = medion_fan_control.cli:main\n"
+            ),
         })
-        self.source_files = dict.fromkeys(REQUIRED_MODULES | REQUIRED_SOURCE_FILES, b"source fixture\n")
+        self.source_files = dict.fromkeys(REQUIRED_PACKAGE_FILES | REQUIRED_SOURCE_FILES, b"source fixture\n")
         self.source_files.update({"PKG-INFO": metadata, "tests/test_gui.py": b"# test fixture\n"})
 
     def build_fixtures(self, *, symlink=False):
@@ -100,6 +105,7 @@ class DistributionTests(unittest.TestCase):
     def test_requires_application_modules_license_and_launcher(self):
         for name in (
             "medion_fan_control/cli.py",
+            "medion_fan_control/assets/x10-control.svg",
             f"{self.dist_info}/licenses/LICENSE",
             f"{self.dist_info}/entry_points.txt",
         ):
@@ -112,7 +118,8 @@ class DistributionTests(unittest.TestCase):
 
     def test_rejects_wrong_launcher(self):
         self.wheel_files[f"{self.dist_info}/entry_points.txt"] = (
-            b"[gui_scripts]\nmedion-fan-control = medion_fan_control.gui:main\n"
+            b"[console_scripts]\nx10ctld = medion_fan_control.daemon:main\n"
+            b"[gui_scripts]\nmedion-fan-control = medion_fan_control.gui:main\nx10-control = medion_fan_control.cli:main\n"
         )
         self.build_fixtures()
         with self.assertRaisesRegex(ValueError, "entry point"):
@@ -130,7 +137,8 @@ class DistributionTests(unittest.TestCase):
             check_distributions(self.root)
 
     def test_source_distribution_requires_documentation_and_tests(self):
-        for name in ("README.md", "docs/user-guide.md", "tools/release.py", "tests/test_gui.py"):
+        for name in ("README.md", "CHANGELOG.md", "docs/user-guide.md", "tools/release.py", "tests/test_gui.py",
+                     "ext/arc-dgpu-ctl/src/arc-dgpu-ctl"):
             with self.subTest(name=name):
                 data = self.source_files.pop(name)
                 self.build_fixtures()
@@ -139,7 +147,8 @@ class DistributionTests(unittest.TestCase):
                 self.source_files[name] = data
 
     def test_rejects_intermediate_or_unrelated_files(self):
-        for name in ("scripts/probe.c", "artifacts/capture.txt", ".github/workflows/release.yml"):
+        for name in ("scripts/probe.c", "artifacts/capture.txt", ".github/workflows/release.yml",
+                     "ext/arc-dgpu-ctl/.git"):
             with self.subTest(name=name):
                 self.source_files[name] = b"unrelated"
                 self.build_fixtures()
@@ -169,6 +178,29 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("Release validation failed", errors.getvalue())
         self.assertEqual(output.getvalue(), "")
         self.assertFalse((self.root / "SHA256SUMS").exists())
+
+
+class ChangelogTests(unittest.TestCase):
+    CHANGELOG = (
+        "# Changelog\n\n## [Unreleased]\n\n- pending\n\n"
+        "## [1.2.3rc1] - 2026-10-01\n\n- candidate\n\n"
+        "## [1.2.3] - 2026-10-09\n\n### Added\n\n- icons\n\n"
+        "## [1.2.2] - 2026-09-01\n\n- older\n"
+    )
+
+    def test_extracts_only_the_matching_section(self):
+        self.assertEqual(changelog_section(self.CHANGELOG, "1.2.3"), "### Added\n\n- icons")
+        self.assertEqual(changelog_section(self.CHANGELOG, "1.2.3rc1"), "- candidate")
+        self.assertEqual(changelog_section(self.CHANGELOG, "9.9.9"), "")
+
+    def test_notes_command_prints_section_and_rejects_bad_tags(self):
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "CHANGELOG.md"
+        path.write_text(self.CHANGELOG, encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(["notes", "v1.2.2", "--changelog", str(path)]), 0)
+        self.assertEqual(output.getvalue(), "- older\n")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(["notes", "1.2.2", "--changelog", str(path)])
 
 
 if __name__ == "__main__":

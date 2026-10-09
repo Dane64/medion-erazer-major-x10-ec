@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest a new control or an improvement to the app.
+labels: [enhancement, needs-triage]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do?
+      description: Describe the outcome you are after, not only the solution.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - GUI / usability
+        - Fans and profiles
+        - CPU
+        - GPU
+        - Display
+        - Audio
+        - Lighting
+        - Installation / packaging
+        - Documentation
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Interface or evidence
+      description: >
+        For new hardware commands, point to the Linux interface or vendor behaviour it relies on.
+        Do not attach vendor binaries or firmware dumps.

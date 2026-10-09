@@ -12,3 +12,11 @@ build/
 dist/
 log/
 *.log
+# kernel module build output
+*.ko
+*.o
+*.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order

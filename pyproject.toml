@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "medion-erazer-major-x10-ec"
 dynamic = ["version"]
-description = "Linux fan, profile, telemetry, and lighting controls for the Medion Erazer Major X10"
+description = "Secure Boot compatible fan, CPU, GPU, display, audio and lighting control for the MEDION Erazer Major X10"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -27,7 +27,11 @@ classifiers = [
 dependencies = ["PySide6>=6.8,<7"]
 
 [project.gui-scripts]
+x10-control = "medion_fan_control.cli:main"
 medion-fan-control = "medion_fan_control.cli:main"
+
+[project.scripts]
+x10ctld = "medion_fan_control.daemon:main"
 
 [project.urls]
 Homepage = "https://github.com/Dane64/medion-erazer-major-x10-ec"
@@ -59,10 +63,16 @@ include = [
     "/medion_fan_control",
     "/tests",
     "/tools/release.py",
+    "/kernel",
+    "/packaging",
+    "/scripts",
     "/docs",
+    "/ext/arc-dgpu-ctl",
     "/README.md",
+    "/CHANGELOG.md",
     "/CONTRIBUTING.md",
     "/LICENSE",
     "/pyproject.toml",
     "/uv.lock",
 ]
+exclude = ["/ext/arc-dgpu-ctl/.git"]

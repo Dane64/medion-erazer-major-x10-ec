@@ -6,12 +6,13 @@ and [protocol reference](docs/protocol.md).
 
 ## Development
 
-Use Python 3.11 or newer and `uv`. Install dependencies without administrator
-privileges:
+Setup, tests and package builds are described in
+[Building from source](docs/building.md). In short:
 
 ```bash
+git submodule update --init
 uv sync --locked --group build
-uv run --no-sync medion-fan-control --demo
+uv run --no-sync x10-control --demo
 uv run --no-sync python -m unittest discover -s tests -v
 ```
 
@@ -31,32 +32,40 @@ or write hardware or persisted user settings.
 
 ## Source organization
 
-| Module | Responsibility |
-| --- | --- |
-| `cli.py`, `__main__.py` | Launch arguments, version output, and application startup |
-| `gui.py` | Window composition, confirmations, asynchronous work, and visible state |
-| `widgets.py`, `theme.py` | Reusable Qt widgets, graph rendering, and presentation |
-| `telemetry.py` | Bounded, monotonic in-memory history |
-| `controller.py` | Session lifecycle, simulated controller, and apply-then-save orchestration |
-| `protocol.py` | Vendor commands, timing, retries, and verified readback |
-| `hardware.py` | DMI/security/power guards, locking, and byte-I/O transport |
-| `lighting.py` | RGB values, verified HID discovery, and report transport |
-| `settings.py` | Validated loading and atomic, owner-only settings persistence |
-| `tools/release.py` | Release tag, distribution-content, and checksum validation |
+| Path | Responsibility |
+|---|---|
+| `kernel/x10_ec.c` | Signed module: EC byte allowlist and bounded voltage offsets (GPL-2.0-only) |
+| `daemon.py` | x10ctld: socket server, peer authorization, dispatch, persistence, startup restore |
+| `client.py` | GUI-side socket client and the in-process demo backend |
+| `cli.py`, `__main__.py` | Launch arguments, version output, application startup |
+| `gui.py` | Window, sidebar, the six pages, confirmations, asynchronous calls |
+| `widgets.py`, `theme.py` | Graph, toggle switch, value slider, Erazer palette and stylesheet |
+| `icons.py`, `assets/` | Navigation icons, app logo (`x10-control.svg`) and the bundled Outfit font |
+| `controller.py`, `protocol.py` | EC session lifecycle, vendor commands, timing, verified readback |
+| `hardware.py` | DMI/security/power guards, EC device selection, byte-I/O transport |
+| `lighting.py` | RGB/zone model, on/off and brightness resolution, HID transport |
+| `cpu.py`, `gpu.py`, `display.py`, `audio.py` | sysfs/tool backends for each tab |
+| `sysfs.py`, `settings.py` | Rooted sysfs access for tests; atomic state persistence |
+| `packaging/`, `scripts/` | systemd, udev, modprobe, initramfs hook, installer, MOK signing |
+| `tools/release.py` | Release tag, changelog notes, distribution-content, and checksum validation |
+| `ext/arc-dgpu-ctl` | Pinned submodule for dGPU power gating; changes go to [its own repository](https://github.com/Dane64/arc-dgpu-ctl) |
 
-Keep Qt out of the protocol, transport, session, and settings layers. All EC
-session operations, including opening and closing, run on one serialized
-worker. HID writes and settings persistence use a separate serialized worker.
-Worker completion must not overwrite a newer pending operation's UI state.
+Keep Qt out of everything except `gui.py`, `widgets.py`, `icons.py` and `theme.py`. The
+daemon is stdlib-only. All backends take a `Sysfs(root)` or an injectable
+command runner, so tests build fake `/sys` trees (`tests/fakesys.py`) instead of
+touching hardware.
 
-Treat a failed firmware readback as unknown state, not a successful change or
-proof that the old state is still current. Surface expected failures with
-actionable messages. Release open resources on failure, and never silently
-default to a permissive hardware or power state.
+Treat a failed readback as unknown state, not success. Validate a whole request
+before the first write. Never widen the kernel allowlist without attributable
+vendor or firmware evidence, documented in [protocol](docs/protocol.md).
 
-Keep the supported operations narrow. Add regression tests for changed
-behavior, including cancellation, failure, and cleanup paths. Document
-user-visible changes and protocol evidence alongside the implementation.
+### UI conventions
+
+- Use the colors and fonts from `theme.py`; don't hard-code new ones in pages.
+- Every page subclasses `Page`, sets `title`, `subtitle` and `glyph` (an icon
+  name from `icons.GLYPHS`), and groups controls with `section()`.
+- New icons are 24x24 single-stroke SVG paths added to `icons.GLYPHS`.
+- Hardware changes go through `Page.confirm()` with *No* as the default.
 
 ## Dependencies and packaging
 
@@ -77,8 +86,10 @@ Start with an empty output directory, or use `uv build --out-dir` and pass that
 same directory to the package checker. Versioning comes from Git tags. A source
 checkout without Git metadata is not a substitute for a published sdist.
 
-The sdist includes source, tests, documentation, the lock file, and the release
-checker. The wheel includes only the application and package metadata.
+The sdist is the complete installer source: application, tests, documentation,
+kernel module, packaging, scripts, the bundled `ext/arc-dgpu-ctl`, the lock file
+and the release checker. The wheel includes only the application, its assets
+and package metadata.
 Generated files, local captures, obsolete research utilities, and logs do not
 belong in either distribution.
 
@@ -86,11 +97,14 @@ belong in either distribution.
 
 Explain the user-visible outcome and why the change is needed. Include the
 relevant regression coverage and update documentation when behavior changes.
+Add a line under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) for anything
+users will notice; it becomes the release notes.
 Do not include vendor binaries, firmware dumps, serial numbers, local build
 artifacts, or unrelated formatting churn.
 
-CI runs the application and release-checker tests on Python 3.11 through 3.14,
-builds a wheel from the sdist, checks package contents, and exercises the
-installed wheel outside the checkout. The **Quality gate** job is the required
-aggregate result. Maintainer publishing instructions are in
-[Releases](docs/releases.md).
+CI runs the tests on Python 3.11 through 3.14, builds the kernel module with
+`-Werror`, lints shell scripts, validates the desktop entry, systemd unit and
+udev rules, runs the submodule's checks, builds a wheel from the sdist, checks
+package contents, and exercises the installed wheel outside the checkout. The
+**Quality gate** job is the required aggregate result. Maintainer publishing
+instructions are in [Releases](docs/releases.md).

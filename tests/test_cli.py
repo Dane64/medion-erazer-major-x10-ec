@@ -32,7 +32,7 @@ class CliTests(unittest.TestCase):
             [sys.executable, "-m", "medion_fan_control", "--version"],
             check=True, capture_output=True, text=True, timeout=10,
         )
-        self.assertEqual(result.stdout, f"medion-fan-control {__version__}\n")
+        self.assertEqual(result.stdout, f"x10-control {__version__}\n")
 
     def test_unknown_options_fail_with_usage(self):
         with contextlib.redirect_stderr(io.StringIO()) as output:

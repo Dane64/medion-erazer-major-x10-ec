@@ -1,0 +1,3 @@
+[submodule "ext/arc-dgpu-ctl"]
+	path = ext/arc-dgpu-ctl
+	url = ../arc-dgpu-ctl
