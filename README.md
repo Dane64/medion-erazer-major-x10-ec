@@ -1,119 +1,126 @@
-# Medion Major X10 Control
+<p align="center">
+  <img src="medion_fan_control/assets/x10-control.svg" width="112" alt="Erazer Control logo">
+</p>
 
-[![CI](https://github.com/Dane64/medion-erazer-major-x10-ec/actions/workflows/ci.yml/badge.svg)](https://github.com/Dane64/medion-erazer-major-x10-ec/actions/workflows/ci.yml)
+<h1 align="center">Erazer Control</h1>
 
-An unofficial Linux desktop application for the **Medion Erazer Major X10**.
-Monitor CPU and GPU temperatures and fan speeds, select firmware performance
-profiles, and configure static chassis lighting from one PySide6 interface.
+<p align="center">
+  An unofficial Linux control center for the MEDION Erazer Major X10.<br>
+  Fans, CPU, GPU, display, audio and lighting in one app, with Secure Boot on and no sudo.
+</p>
 
-**Hardware support is experimental and restricted to the exact machine and
-firmware listed below.** This project is not affiliated with or endorsed by
-MEDION.
+<p align="center">
+  <a href="https://github.com/Dane64/medion-erazer-major-x10-ec/actions/workflows/ci.yml"><img src="https://github.com/Dane64/medion-erazer-major-x10-ec/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Dane64/medion-erazer-major-x10-ec/releases"><img src="https://img.shields.io/github/v/release/Dane64/medion-erazer-major-x10-ec?include_prereleases&color=0a8fff" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0%20%2F%20GPL--2.0-0a8fff" alt="License"></a>
+</p>
+
+![Erazer Control dashboard](docs/images/dashboard.png)
+
+> [!NOTE]
+> This project is not affiliated with or endorsed by MEDION. It only runs on the
+> Erazer Major X10. The kernel module, the daemon and the lighting backend each
+> check the machine's identity and refuse to start anywhere else.
 
 ## Features
 
-- **Dashboard:** CPU/GPU fan RPM and temperatures, with 30-second to 10-minute
-  telemetry history.
-- **Performance:** Office, Gaming, and Turbo firmware profiles, plus a global
-  full-speed fan override.
-- **Lighting:** independent static colors for the keyboard, lid logo, and
-  left/right side lights, with saved selections restored on startup.
-- **Demo mode:** explore the interface and lighting controls without hardware
-  access, administrator privileges, or changes to saved settings.
+| Page | What you can control |
+|---|---|
+| **Dashboard** | Office / Gaming / Turbo firmware profile, full-speed fans, live fan RPM and temperatures with 30 s to 10 min of history |
+| **CPU** | Turbo boost, governor, energy-performance preference, performance %, P-core / E-core frequency limits, RAPL power limits, optional voltage offsets |
+| **GPU** | Discrete Arc GPU on/off (through `arc-dgpu-ctl`), runtime-PM state, frequency limits for iGPU and dGPU, dGPU power limit |
+| **Display** | Backlight, refresh rate and VRR (KDE Plasma), panel overclock through an EDID override |
+| **Audio** | Every writable mixer control the codec exposes, HDA power saving |
+| **LED** | Per-zone color and on/off, brightness, all on / all off |
 
-There is no verified interface for arbitrary fan RPM, PWM, fan-off commands,
-or custom temperature curves. The graph displays telemetry; it does not edit
-the firmware's fan policy.
+Every page can re-apply its settings when the daemon starts. See the
+[user guide](docs/user-guide.md) for details on each control.
 
-## Quick start
+### What the hardware does *not* allow
 
-Use a Linux desktop with Python **3.11 or newer** and
-[`uv`](https://docs.astral.sh/uv/). CI covers Python 3.11 through 3.14.
-The locked Qt wheels require a compatible Linux distribution; on x86-64,
-glibc 2.34 or newer is required.
+- **No custom fan curves or RPM targets.** The firmware only offers its profiles and full speed.
+- **No Arc GPU voltage or clocks above the driver maximum.**
+- **Undervolting may be locked** by the firmware. The app detects this and says so instead of pretending.
+- **Panel overclock is limited** by the EDID format and the panel itself.
+
+## Install
+
+On Debian, Ubuntu and derivatives:
 
 ```bash
-git clone https://github.com/Dane64/medion-erazer-major-x10-ec.git
+git clone --recurse-submodules https://github.com/Dane64/medion-erazer-major-x10-ec.git
 cd medion-erazer-major-x10-ec
+sudo scripts/install.sh            # add --enable-undervolt to expose voltage offsets
+```
+
+Or download `medion_erazer_major_x10_ec-<version>.tar.gz` from the
+[latest release](https://github.com/Dane64/medion-erazer-major-x10-ec/releases),
+extract it and run `sudo bash scripts/install.sh` inside the folder.
+
+The installer builds and signs the `x10_ec` kernel module with DKMS, installs
+the `x10ctld` service, the app, its menu entry and icon, and the bundled
+`arc-dgpu-ctl`. It creates the `x10ctl` group and adds you to it.
+
+With Secure Boot enabled you enrol the signing key once:
+
+1. Choose a one-time password when `mokutil` asks.
+2. Reboot. In the blue **MokManager** screen pick *Enroll MOK -> Continue -> Yes*, enter the password and reboot.
+3. Log in again (for the new group) and start **Erazer Control** from the application menu.
+
+Check that everything is running:
+
+```bash
+systemctl status x10ctld           # active (running)
+modinfo -F signer x10_ec           # your MOK name
+```
+
+Remove everything with `sudo scripts/uninstall.sh`. Details and troubleshooting
+are in [Secure Boot and MOK](docs/secure-boot.md).
+
+### Try it without the laptop
+
+```bash
 uv sync --locked
-uv run --no-sync medion-fan-control --demo
+uv run --no-sync x10-control --demo
 ```
 
-The desktop uses normal click and keyboard tab navigation. Controls and
-telemetry cards reflow as the window is resized.
+Demo mode simulates the daemon. Nothing is read, written or saved.
 
-```bash
-uv run --no-sync medion-fan-control --help
-uv run --no-sync medion-fan-control --version
+## How it works
+
+```mermaid
+flowchart LR
+    GUI["Erazer Control GUI<br/>(your user, no sudo)"] -- "JSON over /run/x10ctld/x10ctld.sock<br/>root:x10ctl 0660 + peer check" --> D["x10ctld<br/>(root, systemd)"]
+    D -- "/dev/x10-ec (allowlisted bytes)" --> M["x10_ec.ko<br/>signed with your MOK"]
+    M -- "ports 0x6c / 0x68" --> EC[(Embedded controller)]
+    M -- "MSR 0x150 (opt-in)" --> CPU[(Voltage offsets)]
+    D -- hidraw --> LED[(Lighting controller)]
+    D -- sysfs --> K[(intel_pstate, RAPL,<br/>i915/xe, backlight, HDA)]
+    D -- exec --> G[arc-dgpu-ctl]
+    GUI -- "amixer / kscreen-doctor" --> S[(Desktop session)]
 ```
 
-### Hardware mode
-
-**Read the [user guide and safety notes](docs/user-guide.md) before proceeding.**
-EC access uses direct I/O through `/dev/port`, including for telemetry requests.
-It requires administrator privileges and is blocked by Secure Boot or kernel
-lockdown. The application does not bypass these protections.
-
-After reviewing those requirements, run the installed launcher rather than
-running the package manager as root:
-
-```bash
-sudo -H --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR \
-  "$(pwd)/.venv/bin/medion-fan-control"
-```
-
-Desktop authorization varies between X11 and Wayland; see
-[troubleshooting](docs/user-guide.md#troubleshooting) if the privileged window
-cannot connect to your desktop.
-
-## Supported hardware
-
-Every field below must match exactly before the hardware backend can open.
-There is no force or unsupported-hardware option.
-
-| DMI field | Required value |
-| --- | --- |
-| System vendor | `MEDION` |
-| Product name | `Major X10` |
-| Product SKU | `ML-210015 30034642` |
-| Mainboard name | `N68630` |
-| Mainboard revision | `1.0` |
-| BIOS version | `M1IB008` |
-| EC firmware release | `0.8` |
-
-Lighting additionally requires USB HID device `1a2c:1512`, interface `03`,
-with the exact report descriptor accepted by the backend.
-
-Turbo requires the AC barrel adapter. USB-C PD is not sufficient. Power is
-checked again before each Turbo write, not just when enabling the button.
-
-**Closing the application leaves the last firmware profile and full-speed
-setting in place.** Turn off **Full speed** to resume the selected profile's
-automatic fan behavior.
+The GUI never touches hardware itself. It talks to the `x10ctld` daemon over a
+local socket that only members of the `x10ctl` group can open. With Secure Boot
+on, kernel lockdown blocks raw port and MSR access even for root, so the small
+signed **x10_ec** module forwards only an allowlist of documented EC commands
+and, if you opt in, bounded and readback-verified voltage offsets.
 
 ## Documentation
 
 | Guide | Contents |
-| --- | --- |
-| [User guide](docs/user-guide.md) | Hardware access, controls, saved lighting, and troubleshooting |
-| [Protocol reference](docs/protocol.md) | Supported EC/HID operations, timing, validation, and provenance |
-| [Contributing](CONTRIBUTING.md) | Source organization, development, and hardware-isolated tests |
-| [Releases](docs/releases.md) | Builds, version tags, release safeguards, and maintainer setup |
+|---|---|
+| [User guide](docs/user-guide.md) | First start, every page, safety notes, troubleshooting |
+| [Secure Boot and MOK](docs/secure-boot.md) | Signing, key enrolment, verification |
+| [Building from source](docs/building.md) | Development setup, tests, kernel module, packages |
+| [Protocol reference](docs/protocol.md) | EC and lighting commands, kernel allowlist, voltage mailbox |
+| [Contributing](CONTRIBUTING.md) | Code layout, conventions, pull requests |
+| [Releases](docs/releases.md) | Versioning and the release procedure |
+| [Changelog](CHANGELOG.md) | What changed in each version |
 
-## Development and releases
+## License
 
-```bash
-uv sync --locked --group build
-uv run --no-sync python -m unittest discover -s tests -v
-uv build --no-build-isolation
-uv run --no-sync python tools/release.py check dist
-```
-
-Use an empty build output directory; the package check rejects mixed versions
-and stale distributions. Pull requests and branch pushes run the same quality
-pipeline used by version-tag releases. Release artifacts include a wheel,
-source distribution, and SHA-256 checksums.
-
-Download published packages from
-[GitHub Releases](https://github.com/Dane64/medion-erazer-major-x10-ec/releases).
-The project is licensed under [Apache-2.0](LICENSE).
+Apache-2.0 for the application. The kernel module in [`kernel/`](kernel) is
+GPL-2.0-only because it links against the Linux kernel. The bundled Outfit
+typeface is licensed under the [SIL Open Font License 1.1](medion_fan_control/assets/fonts/OFL.txt).
+`arc-dgpu-ctl` in [`ext/`](ext/arc-dgpu-ctl) carries its own license.

@@ -2,9 +2,8 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
-from medion_fan_control.controller import DemoController, ProtocolSession, apply_and_save_lighting
+from medion_fan_control.controller import DemoController, ProtocolSession
 from medion_fan_control.hardware import HardwareAccessError
-from medion_fan_control.lighting import LightingAccessError, LightZone, RgbColor
 from medion_fan_control.protocol import InsufficientPowerError, Profile, ProtocolError
 
 
@@ -112,38 +111,6 @@ class DemoControllerTests(unittest.TestCase):
             controller.set_full_speed(True)
             controller.set_full_speed(False)
             self.assertEqual(controller.read_status(), expected)
-
-
-class LightingOperationTests(unittest.TestCase):
-    def setUp(self):
-        self.colors = {LightZone.KEYBOARD: RgbColor(1, 2, 3)}
-
-    def test_failed_hardware_write_does_not_save_the_selection(self):
-        with (
-            patch("medion_fan_control.controller.apply_static_lighting", side_effect=LightingAccessError("HID failed")),
-            patch("medion_fan_control.controller.save_lighting_colors") as save,
-        ):
-            with self.assertRaisesRegex(LightingAccessError, "HID failed"):
-                apply_and_save_lighting(self.colors)
-            save.assert_not_called()
-
-    def test_save_failure_distinguishes_applied_colors_from_persisted_colors(self):
-        with (
-            patch("medion_fan_control.controller.apply_static_lighting") as apply,
-            patch("medion_fan_control.controller.save_lighting_colors", side_effect=LightingAccessError("disk full")),
-        ):
-            with self.assertRaisesRegex(LightingAccessError, "Lighting applied, but.*disk full"):
-                apply_and_save_lighting(self.colors)
-            apply.assert_called_once_with(self.colors)
-
-    def test_applies_before_saving(self):
-        operations = Mock()
-        with (
-            patch("medion_fan_control.controller.apply_static_lighting", operations.apply),
-            patch("medion_fan_control.controller.save_lighting_colors", operations.save),
-        ):
-            apply_and_save_lighting(self.colors)
-        self.assertEqual([call[0] for call in operations.mock_calls], ["apply", "save"])
 
 
 if __name__ == "__main__":

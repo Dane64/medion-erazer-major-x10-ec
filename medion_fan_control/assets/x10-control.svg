@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" width="256" height="256" viewBox="0 0 256 256">
+  <title>Erazer Control</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151b26"/>
+      <stop offset="1" stop-color="#06080c"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3fb0ff"/>
+      <stop offset="1" stop-color="#0a6fe0"/>
+    </linearGradient>
+  </defs>
+  <rect x="10" y="10" width="236" height="236" rx="52" ry="52" fill="url(#bg)" stroke="#0a8fff" stroke-opacity="0.6" stroke-width="5"/>
+  <g transform="translate(128 128)">
+    <path d="M -84 -18 A 86 86 0 0 1 18 -84" fill="none" stroke="url(#blue)" stroke-width="9" stroke-linecap="round"/>
+    <path d="M 84 18 A 86 86 0 0 1 -18 84" fill="none" stroke="url(#blue)" stroke-width="9" stroke-linecap="round"/>
+    <polygon points="34,-62 64,-62 -34,62 -64,62" fill="#0a6fd8"/>
+    <polygon points="-72,-68 -36,-68 72,68 36,68" fill="#0c1018"/>
+    <polygon points="-64,-62 -34,-62 64,62 34,62" fill="url(#blue)"/>
+    <circle cx="0" cy="0" r="9" fill="#e8eef7"/>
+  </g>
+</svg>

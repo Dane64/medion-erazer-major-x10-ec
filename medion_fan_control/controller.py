@@ -2,18 +2,15 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from typing import Protocol
 
 from .hardware import HardwareAccessError, UnsupportedHardwareError
-from .lighting import LightingAccessError, LightZone, RgbColor, apply_static_lighting
 from .protocol import FanStatus, InsufficientPowerError, Profile, ProtocolError
-from .settings import save_lighting_colors
 
 
 SESSION_ERRORS = (HardwareAccessError, UnsupportedHardwareError, ProtocolError, OSError)
-LIGHTING_ERRORS = (LightingAccessError, UnsupportedHardwareError, OSError)
 
 
 class FanController(Protocol):
@@ -111,11 +108,3 @@ class DemoController:
 @contextmanager
 def open_demo_protocol() -> Iterator[DemoController]:
     yield DemoController()
-
-
-def apply_and_save_lighting(colors: Mapping[LightZone, RgbColor]) -> None:
-    apply_static_lighting(colors)
-    try:
-        save_lighting_colors(colors)
-    except LightingAccessError as error:
-        raise LightingAccessError(f"Lighting applied, but the selection was not saved: {error}") from error

@@ -1,90 +1,56 @@
-import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from medion_fan_control.lighting import LightingAccessError, LightZone, RgbColor
-from medion_fan_control.settings import lighting_config_path, load_lighting_colors, save_lighting_colors
+from medion_fan_control.settings import SettingsError, StateStore, load_json, save_json_atomic
 
 
-class LightingSettingsTests(unittest.TestCase):
+class StateStoreTests(unittest.TestCase):
     def setUp(self):
-        self.directory = self.enterContext(tempfile.TemporaryDirectory())
-        self.root = Path(self.directory)
-        self.path = self.root / "config" / "lighting.json"
-        self.colors = {
-            LightZone.KEYBOARD: RgbColor(0x12, 0x34, 0x56),
-            LightZone.RIGHT_SIDE: RgbColor(0xAB, 0xCD, 0xEF),
-        }
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "state" / "state.json"
 
-    def test_saves_and_loads_selected_colors_with_private_permissions(self):
-        save_lighting_colors(self.colors, self.path)
-        self.assertEqual(load_lighting_colors(self.path), self.colors)
+    def test_round_trip_with_private_permissions(self):
+        save_json_atomic(self.path, {"a": 1})
+        self.assertEqual(load_json(self.path), {"a": 1})
         self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.path.parent.stat().st_mode), 0o700)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
-    def test_missing_settings_mean_no_automatic_lighting_write(self):
-        self.assertEqual(load_lighting_colors(self.path), {})
-        self.assertFalse(self.path.parent.exists())
-
-    def test_rejects_corrupt_and_invalid_settings(self):
+    def test_missing_file_is_empty_and_corrupt_file_is_reported(self):
+        self.assertEqual(load_json(self.path), {})
         self.path.parent.mkdir()
-        for document in (
-            "{", "null", "[]", "{}", '{"colors": []}',
-            '{"colors": {"keyboard": "blue"}}', '{"colors": {"unknown": "#123456"}}',
-            '{"colors": {"keyboard": null}}', '{"colors": {"keyboard": 123456}}',
-            '{"colors": {"keyboard": []}}',
-        ):
-            with self.subTest(document=document):
-                self.path.write_text(document, encoding="utf-8")
-                with self.assertRaises(LightingAccessError):
-                    load_lighting_colors(self.path)
+        for text in ("{", "[]", "\xff"):
+            with self.subTest(text=text):
+                self.path.write_text(text, encoding="latin-1")
+                with self.assertRaises(SettingsError):
+                    load_json(self.path)
 
-    def test_rejects_non_utf8_settings(self):
+    def test_store_keeps_load_error_and_starts_empty(self):
         self.path.parent.mkdir()
-        self.path.write_bytes(b"\xff")
-        with self.assertRaisesRegex(LightingAccessError, "cannot load"):
-            load_lighting_colors(self.path)
+        self.path.write_text("{", encoding="utf-8")
+        store = StateStore(self.path)
+        self.assertIsNotNone(store.load_error)
+        self.assertIsNone(store.get("cpu"))
 
-    def test_failed_replace_preserves_previous_settings_and_removes_temporary_file(self):
-        save_lighting_colors(self.colors, self.path)
-        previous = self.path.read_bytes()
-        with patch("medion_fan_control.settings.os.replace", side_effect=PermissionError("permission denied")):
-            with self.assertRaisesRegex(LightingAccessError, "cannot save"):
-                save_lighting_colors({LightZone.LID: RgbColor(0, 0, 0)}, self.path)
-        self.assertEqual(self.path.read_bytes(), previous)
+    def test_merge_is_deep_and_persistent(self):
+        store = StateStore(self.path)
+        store.merge("cpu", {"rapl": {"pl1": {"watts": 40}}, "no_turbo": False})
+        store.merge("cpu", {"rapl": {"pl2": {"watts": 90}}})
+        reloaded = StateStore(self.path)
+        self.assertEqual(reloaded.get("cpu"), {"no_turbo": False, "rapl": {"pl1": {"watts": 40}, "pl2": {"watts": 90}}})
+
+    def test_failed_replace_preserves_previous_document(self):
+        store = StateStore(self.path)
+        store.update("lighting", {"x": 1})
+        with patch("medion_fan_control.settings.os.replace", side_effect=PermissionError("denied")):
+            with self.assertRaises(SettingsError):
+                store.update("lighting", {"x": 2})
+        self.assertEqual(StateStore(self.path).get("lighting"), {"x": 1})
+        self.assertEqual(store.get("lighting"), {"x": 1})
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
-
-    def test_failed_flush_does_not_replace_existing_settings(self):
-        save_lighting_colors(self.colors, self.path)
-        with patch("medion_fan_control.settings.os.fsync", side_effect=OSError("disk full")):
-            with self.assertRaisesRegex(LightingAccessError, "disk full"):
-                save_lighting_colors({}, self.path)
-        self.assertEqual(load_lighting_colors(self.path), self.colors)
-        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
-
-    def test_uses_unique_temporary_files(self):
-        self.path.parent.mkdir()
-        unrelated = self.path.with_suffix(".tmp")
-        unrelated.write_text("another operation", encoding="utf-8")
-        save_lighting_colors(self.colors, self.path)
-        self.assertEqual(unrelated.read_text(encoding="utf-8"), "another operation")
-
-    def test_respects_xdg_configuration_directory(self):
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root)}):
-            self.assertEqual(lighting_config_path(), self.root / "medion-fan-control" / "lighting.json")
-
-    def test_empty_xdg_configuration_uses_effective_users_home(self):
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": ""}), patch("medion_fan_control.settings.Path.home", return_value=self.root):
-            self.assertEqual(lighting_config_path(), self.root / ".config" / "medion-fan-control" / "lighting.json")
-
-    def test_relative_xdg_configuration_is_reported_instead_of_writing_to_cwd(self):
-        with patch.dict(os.environ, {"XDG_CONFIG_HOME": "relative/path"}):
-            with self.assertRaisesRegex(LightingAccessError, "absolute path"):
-                lighting_config_path()
 
 
 if __name__ == "__main__":

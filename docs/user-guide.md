@@ -2,134 +2,138 @@
 
 [Back to the project overview](../README.md)
 
-## Safety and hardware access
+## Getting started
 
-This application supports only the exact DMI, BIOS, and EC identity listed in
-the [README](../README.md#supported-hardware). It refuses other identities rather
-than guessing compatible firmware commands.
+1. Install the app with `sudo scripts/install.sh` (see the [README](../README.md#install)).
+2. Log out and back in once, so your user is a member of the `x10ctl` group.
+3. Start **Erazer Control** from the application menu, or run `x10-control`.
+   No `sudo` is needed.
 
-The EC transport uses `/dev/port`. Even a telemetry read sends command and
-selector bytes to hardware. Incorrect raw I/O can corrupt hardware state.
-Do not run another EC-writing tool alongside this application, reuse values
-from unrelated laptop profiles, or write to tachometer selectors.
+The window has three areas:
 
-The application holds an exclusive lock for the EC session and a separate lock
-while applying lighting. These locks coordinate instances of this application;
-they cannot stop another program that ignores them.
+| Area | Purpose |
+|---|---|
+| **Sidebar** | One icon per page: Dashboard, CPU, GPU, Display, Audio, LED. The highlighted entry is the open page. At the bottom it shows whether Secure Boot is on and the signed module is loaded. |
+| **Page** | A header with the page icon, title and a **Reload** button, then panels with the controls. Changes that touch hardware ask for confirmation first; the default answer is always *No*. |
+| **Status bar** | Connection state (`EC CONNECTED`, `DEMO DATA`, `OFFLINE`), the last message from the daemon, and **Retry connection**. |
 
-The GUI currently runs with the privileges needed for hardware access; there
-is no separate privileged service. Install dependencies as your normal user,
-then elevate only the installed launcher as shown in the README. No device
-permissions, boot settings, or services are changed automatically.
+The badge in the top-right corner always shows the current firmware
+performance mode as read back from the hardware.
 
-### Secure Boot and kernel lockdown
+The CPU, GPU, Audio and LED pages have a **Re-apply ... at startup** switch.
+When it's on, `x10ctld` re-applies that page's last saved settings at boot.
 
-The application checks both the UEFI Secure Boot variable and the kernel
-lockdown state before opening the EC transport. It reports malformed or
-unreadable states instead of assuming access is safe.
+## Safety and access model
 
-If Secure Boot is enabled, use `--demo` unless you deliberately choose to
-change the machine's boot policy. **Disabling Secure Boot reduces boot
-protection** and may cause disk encryption or another operating system to ask
-for a recovery key.
-
-To change it, first have any recovery keys available. Restart into UEFI/BIOS
-setup using the key shown at startup, commonly F2. Find Secure Boot under
-Security or Boot, set it to Disabled, save, and reboot.
-
-When the kernel exposes the lockdown interface, an unlocked system reports:
-
-```text
-$ cat /sys/kernel/security/lockdown
-[none] integrity confidentiality
-```
-
-Lockdown can also be enabled independently of Secure Boot. If `integrity` or
-`confidentiality` remains selected, consult your distribution's kernel and boot
-policy. The app cannot bypass lockdown, even as root.
+- `x10ctld` runs as root and is the only process that touches hardware. The GUI
+  talks to it over `/run/x10ctld/x10ctld.sock` (`root:x10ctl`, mode 0660). The
+  daemon also checks each client's credentials, so only root and `x10ctl`
+  members are served.
+- The EC is reached through the signed `x10_ec` module, which only forwards the
+  documented commands. Without the module, the daemon falls back to `/dev/port`,
+  and only when the kernel is not locked down.
+- Every hardware write is confirmed by readback where the interface allows it.
+  If a readback fails, the state is reported as unknown, never as success.
+- Settings are saved in `/var/lib/x10ctld/state.json` (root, 0600) after a
+  successful apply. **Re-apply at startup** is a per-tab switch.
+- Don't run another EC-writing tool at the same time. The exclusive open of
+  `/dev/x10-ec` coordinates only with this app.
 
 ## Dashboard
 
-**Performance mode** selects the vendor's Office, Gaming, or Turbo profile.
-Changing it requires confirmation, with **No** selected by default. The
-displayed mode comes from firmware readback, not from the requested button.
+**Performance mode** selects the vendor's Office, Gaming or Turbo profile, after
+a confirmation that defaults to *No*. The shown mode is the firmware's readback.
+Turbo needs the AC barrel adapter, and the daemon checks this again before every
+Turbo write.
 
-**Turbo** is disabled when Linux reports the AC barrel adapter offline. The
-backend checks `/sys/class/power_supply/AC0/online` before every Turbo write.
-Unplugging the adapter while a change is pending cannot bypass that check.
+**Full-speed fans** is a global override. Closing the app leaves it unchanged;
+switch it off to return to the profile's automatic fan behavior.
 
-**Full speed** is a global override for both fans. Disable it to return to the
-automatic policy of the selected performance profile. Closing the app does not
-disable the override or restore an earlier profile.
+The graph shows fan RPM (solid lines, left axis) and temperature (dashed lines,
+right axis). The window slider covers 30 seconds to 10 minutes. History is kept
+in memory only.
 
-The graph shows fan RPM on the left axis and temperatures in Celsius on the
-right. Solid lines represent fan speed; dashed lines represent temperatures.
-The window slider changes the visible history from 30 seconds to 10 minutes.
-History is held in memory and is not logged to disk.
+## CPU
 
-On a transport or readback error, current readings become unavailable and
-hardware controls are disabled. Resolve the reported problem and select
-**Retry connection**. The app opens a new guarded session instead of continuing
-to display stale values as live measurements.
+| Control | Interface |
+|---|---|
+| Turbo boost, min/max performance %, HWP dynamic boost | `intel_pstate` |
+| Governor, energy-performance preference | every cpufreq policy |
+| P-core / E-core frequency limits | cpufreq policies grouped by hardware maximum |
+| PL1, PL1 time window, PL2 | `intel-rapl` and `intel-rapl-mmio` package zones (both are written) |
+| Voltage offsets | `x10_ec` OC mailbox, opt-in |
 
-## Lighting
+The EC firmware profile can still enforce its own power limits on top of RAPL.
+Check the result under load.
 
-Choose a zone or **All zones** to stage a color. Swatches show your selection,
-not a readback of the physical LEDs. **Apply colors** asks for confirmation,
-applies the selected zones in three complete passes, and saves only a
-successfully applied selection.
+**Voltage offsets.** Lower in 10 mV steps and stress-test each step. Too much
+undervolt freezes the system. If startup restore is on and a boot does not
+survive 120 seconds, the next start skips the offsets once. You can change the
+window with `undervolt_stability_s` in `/etc/x10ctld.conf`. If the module
+reports that the firmware ignored the offset, the BIOS has undervolt protection
+enabled.
 
-Saved colors are restored once after the hardware session first connects.
-Unconfirmed edits are never included in that automatic restore. The restore
-does not change the firmware performance profile or fan override.
+## GPU
 
-Lighting has its own persistent status message so telemetry updates do not
-hide write or save errors. If applying succeeds but saving fails, the message
-explicitly distinguishes the two outcomes. Already-confirmed work finishes
-when the window closes, including saving the applied colors.
+**Discrete GPU power** runs your `arc-dgpu-ctl` (`on` / `off` by default; set the
+verbs in `[dgpu]` of `/etc/x10ctld.conf`). The state badge comes from sysfs:
+*off* (not on the PCI bus), *unbound* (no driver), *suspended* or *active*
+(runtime PM). Close applications that use the dGPU before you power it off.
 
-Settings are stored in:
+**Frequency limits** use i915 `gt_*_freq_mhz` or xe `tile0/gt0/freq0/*`, bounded
+to RPn..RP0. **Power limit** uses the driver's hwmon `power1_max`, bounded by
+`power1_rated_max`. While the dGPU is powered off, its card isn't listed.
 
-```text
-${XDG_CONFIG_HOME:-~/.config}/medion-fan-control/lighting.json
-```
+## Display
 
-`XDG_CONFIG_HOME`, when set, must be an absolute path. The settings belong to
-the effective user running the GUI. With the documented `sudo -H` command
-and no configured `XDG_CONFIG_HOME`, that is normally
-`/root/.config/medion-fan-control/lighting.json`, not your desktop user's home.
-Files are replaced atomically with owner-only permissions.
+- **Backlight** writes the panel's backlight device.
+- **Refresh rate and VRR** use `kscreen-doctor` in your Plasma session. On other
+  desktops this panel explains that it isn't available.
+- **Panel overclock** creates `/usr/lib/firmware/edid/x10-<connector>-<Hz>.bin`:
+  a copy of the panel EDID with the fastest timing's pixel clock scaled up.
+  Nothing changes until you add the shown parameter, for example
+  `drm.edid_firmware=eDP-1:edid/x10-eDP-1-170hz.bin`, to
+  `GRUB_CMDLINE_LINUX_DEFAULT`, then run `sudo update-initramfs -u && sudo update-grub`
+  and reboot. The installed initramfs hook copies the override so it also works
+  when i915 loads early.
+  - The ceiling is the lower of +20 % and the EDID limit of 655.35 MHz.
+  - The app refuses when the fastest mode is stored in a DisplayID or CTA
+    extension block. Overriding the base timing would *lower* the refresh rate.
+  - If the panel stays black, press `e` in GRUB, delete the parameter for that
+    boot, then remove it from `/etc/default/grub` and select **Remove override**.
 
-To stop restoring a saved selection, close the application and remove its
-`lighting.json` file. This does not itself send any lighting command. A malformed
-file is reported and is not automatically applied.
+## Audio
 
-Lighting uses a separate, verified HID interface. Manual lighting changes can
-still work when EC access is unavailable, provided the machine identity, HID
-descriptor, and device permissions are valid.
+The sound-card panel lists every writable mixer control that the codec driver
+publishes (`amixer contents`): output and input volumes, switches, auto-mute,
+loopback mixing, mic boost and routing. Stereo controls are kept balanced.
+These run in your session, like any mixer.
 
-## Demo mode
+**HDA power saving** sets `snd_hda_intel` `power_save` and
+`power_save_controller`. Use 0 if you hear a click when audio starts.
 
-`medion-fan-control --demo` simulates profile changes, full-speed state, and
-telemetry. It also lets you preview static lighting selections. It does not
-open hardware, read saved lighting, or write settings. The window title and
-connection label identify the simulation.
+## LED
+
+Pick a color per zone, or for all zones at once. Each zone has an **on/off
+switch**. *Off* sends black (R=G=B=0), which leaves the LEDs without current
+and needs no unverified firmware command. The zone keeps its color for when you
+switch it on again. **Brightness** scales the RGB values (0 % = all off).
+**Apply lighting** asks for confirmation, writes three complete passes and saves
+the selection. There's no physical readback of LED colors.
 
 ## Troubleshooting
 
-| Message or symptom | Action |
-| --- | --- |
-| Administrator access required | Run the installed launcher with administrator privileges, not `sudo uv`. Lockdown can still block access. |
-| Unsupported machine or firmware | Compare the reported fields with the allowlist. Use demo mode; do not bypass the guard. |
-| Another process is using the device | Close the other instance. Do not delete an active lock file to bypass the lock. |
-| AC0 status cannot be read | Resolve the missing or unreadable kernel power-supply interface. The backend will not assume Turbo is safe. |
-| Lighting interface not found | The required USB identity, interface, and descriptor were not found. Do not substitute another hidraw node. |
-| Telemetry or change readback failed | Controls are disabled because the current state is unknown. Resolve the device error, then retry. |
-| Colors applied but not saved | Check the effective user's configuration directory and disk space, then apply again. |
-| Qt cannot load the `xcb` or `wayland` plugin | Install the Qt platform plugin's system-library requirements using your distribution's package manager. |
-| Privileged GUI cannot connect to the display | Check the desktop authorization and display variables preserved by `sudo`. Do not disable display access control globally with `xhost +`. |
+| Message | Action |
+|---|---|
+| x10ctld is not running | `systemctl status x10ctld`, `journalctl -u x10ctld` |
+| permission denied: add your user to the x10ctl group | `sudo usermod -aG x10ctl $USER`, then log out and in |
+| Secure Boot ... x10_ec module is not loaded | See [Secure Boot and MOK](secure-boot.md) |
+| Unsupported machine or firmware | The app only runs on the Erazer Major X10 it was built for. Don't bypass the check. |
+| /dev/x10-ec is already open in another process | Another tool is using the EC; stop it |
+| Telemetry or change readback failed | Controls are disabled because the state is unknown; fix the cause, then **Retry connection** |
+| arc-dgpu-ctl not found | Install it or set `[dgpu] command` in `/etc/x10ctld.conf` |
+| Qt cannot load the xcb or wayland plugin | Install the Qt platform plugin's system libraries |
 
-Include the application version, Linux distribution, desktop session type,
-and exact error message when reporting a problem. Share only the allowlisted
-identity fields when necessary; do not upload serial numbers, full DMI dumps,
-firmware binaries, or unreviewed system logs.
+When you report a problem, include the app version, distribution, session type
+and the exact message. Don't upload serial numbers, full DMI dumps or firmware
+binaries.

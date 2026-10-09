@@ -1,0 +1,13 @@
+#!/bin/sh
+# Copy x10-control EDID overrides into the initramfs so drm.edid_firmware works
+# when i915 is loaded early.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+# shellcheck source=/dev/null
+. /usr/share/initramfs-tools/hook-functions
+for edid in /usr/lib/firmware/edid/x10-*.bin; do
+    [ -e "$edid" ] || continue
+    mkdir -p "${DESTDIR}/usr/lib/firmware/edid"
+    cp -p "$edid" "${DESTDIR}/usr/lib/firmware/edid/"
+done

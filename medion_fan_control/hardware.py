@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 from contextlib import contextmanager
@@ -163,11 +164,14 @@ class DevPortIO:
             self._port_fd = os.open(self._port_path, os.O_RDWR | os.O_CLOEXEC)
         except PermissionError as error:
             self.close()
-            raise HardwareAccessError("administrator access is required to open /dev/port") from error
+            raise HardwareAccessError(f"administrator access is required to open {self._port_path}") from error
         except BlockingIOError as error:
             self.close()
             raise HardwareAccessError("another fan-control process is already using the EC ports") from error
         except OSError as error:
+            if error.errno == errno.EBUSY:
+                self.close()
+                raise HardwareAccessError(f"{self._port_path} is already open in another process") from error
             self.close()
             raise HardwareAccessError(f"cannot open {self._port_path}: {error}") from error
         return self
@@ -203,9 +207,28 @@ class DevPortIO:
             raise HardwareAccessError(f"short write to port 0x{port:02x}")
 
 
+KERNEL_EC_DEVICE = Path("/dev/x10-ec")
+LEGACY_PORT_DEVICE = Path("/dev/port")
+
+
+def select_ec_device(kernel_device: Path = KERNEL_EC_DEVICE) -> Path:
+    """Prefer the signed x10_ec module; fall back to /dev/port only when the
+    kernel is not locked down (Secure Boot off)."""
+    if kernel_device.exists():
+        return kernel_device
+    try:
+        require_ec_writes_unlocked()
+    except PlatformSecurityError as error:
+        raise PlatformSecurityError(
+            "Secure Boot / kernel lockdown is active and the signed x10_ec module is not loaded. "
+            "Run scripts/install.sh, enrol the MOK at the next boot, then restart x10ctld."
+        ) from error
+    return LEGACY_PORT_DEVICE
+
+
 @contextmanager
-def open_supported_protocol() -> Iterator[EcProtocol]:
-    require_ec_writes_unlocked()
+def open_supported_protocol(kernel_device: Path = KERNEL_EC_DEVICE) -> Iterator[EcProtocol]:
+    device = select_ec_device(kernel_device)
     require_supported_machine(read_machine_identity())
-    with DevPortIO() as port_io:
+    with DevPortIO(port_path=device) as port_io:
         yield EcProtocol(port_io, turbo_power_available=read_ac0_online)

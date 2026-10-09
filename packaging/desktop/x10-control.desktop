@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Erazer Control
+GenericName=Laptop hardware control
+Comment=Fans, CPU, GPU, display, audio and lighting for the MEDION Erazer Major X10
+Exec=/opt/x10-control/venv/bin/x10-control
+Icon=x10-control
+Terminal=false
+Categories=System;Settings;HardwareSettings;

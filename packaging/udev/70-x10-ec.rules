@@ -1,0 +1,3 @@
+# Only the x10ctld daemon (root) talks to the EC device. Nothing here grants
+# desktop users raw hardware access; they use the daemon socket instead.
+KERNEL=="x10-ec", SUBSYSTEM=="misc", OWNER="root", GROUP="root", MODE="0600"

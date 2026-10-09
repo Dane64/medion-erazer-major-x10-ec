@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
-  workflow_call:
+  workflow_call:  # reused by release.yml
 
 permissions:
   contents: read
@@ -36,6 +36,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          submodules: recursive
           persist-credentials: false
 
       - name: Install uv and Python
@@ -57,6 +58,43 @@ jobs:
       - name: Run hardware-isolated tests
         run: uv run --no-sync python -m unittest discover -s tests -v
 
+  kernel:
+    name: Kernel module and system integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install kernel headers and linters
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --yes --no-install-recommends \
+            "linux-headers-$(uname -r)" shellcheck desktop-file-utils systemd
+
+      - name: Build x10_ec with warnings as errors
+        run: |
+          make -C kernel KVER="$(uname -r)" EXTRA_CFLAGS=-Werror
+          modinfo kernel/x10_ec.ko
+
+      - name: Check shell scripts
+        run: shellcheck scripts/*.sh packaging/initramfs-tools/hooks/x10-edid
+
+      - name: Validate desktop entry, systemd unit and udev rules
+        run: |
+          desktop-file-validate packaging/desktop/x10-control.desktop
+          # the venv launcher only exists after install
+          unit="$RUNNER_TEMP/x10ctld.service"
+          sed 's#^ExecStart=.*#ExecStart=/usr/bin/true#' packaging/systemd/x10ctld.service > "$unit"
+          systemd-analyze verify --man=no "$unit"
+          udevadm verify packaging/udev/70-x10-ec.rules
+
+      - name: Check pinned arc-dgpu-ctl submodule
+        run: make -C ext/arc-dgpu-ctl check
+
   package:
     name: Package
     needs: test
@@ -67,6 +105,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          submodules: recursive
           persist-credentials: false
 
       - name: Install uv and Python
@@ -106,8 +145,9 @@ jobs:
           uv pip sync --python "$smoke/bin/python" --require-hashes "$RUNNER_TEMP/runtime-requirements.txt"
           uv pip install --python "$smoke/bin/python" --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
-          "$smoke/bin/medion-fan-control" --help
+          "$smoke/bin/x10-control" --help
           "$smoke/bin/medion-fan-control" --version
+          "$smoke/bin/x10ctld" --version
           "$smoke/bin/python" -I -m medion_fan_control --version
           "$smoke/bin/python" -I -m unittest discover -s "$GITHUB_WORKSPACE/tests" -p test_gui.py -v
 
@@ -125,12 +165,14 @@ jobs:
   quality:
     name: Quality gate
     if: always()
-    needs: [test, package]
+    needs: [test, kernel, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - name: Require successful tests and packaging
         env:
           TEST_RESULT: ${{ needs.test.result }}
+          KERNEL_RESULT: ${{ needs.kernel.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
-        run: test "$TEST_RESULT" = success && test "$PACKAGE_RESULT" = success
+        run: |
+          test "$TEST_RESULT" = success && test "$KERNEL_RESULT" = success && test "$PACKAGE_RESULT" = success

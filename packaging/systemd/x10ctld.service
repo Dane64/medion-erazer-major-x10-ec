@@ -1,0 +1,26 @@
+[Unit]
+Description=MEDION Erazer Major X10 control daemon
+Documentation=https://github.com/Dane64/medion-erazer-major-x10-ec
+After=systemd-modules-load.service systemd-udev-settle.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/opt/x10-control/venv/bin/x10ctld
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=x10ctld
+RuntimeDirectoryMode=0755
+StateDirectory=x10ctld
+StateDirectoryMode=0700
+# Hardening that still allows sysfs/EC/HID/MSR-module access
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/sys -/usr/lib/firmware/edid /run/lock
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

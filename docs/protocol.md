@@ -4,30 +4,16 @@
 
 This reference documents the operations implemented by the Linux application.
 It is not an invitation to probe unknown commands or use this transport on
-other hardware. The [hardware allowlist](../README.md#supported-hardware)
-applies to every supported hardware session.
+other hardware. Every hardware session is gated by the identity checks in
+`medion_fan_control/hardware.py` and `kernel/x10_ec.c`.
 
 ## Provenance
 
-The protocol is derived from Medion Control Center 2.7.4, distributed in Medion
-download ID `22751` as `17.ControlCenter_MajorX10.zip`. The installer was
-extracted without executing it.
-
-| Source artifact | Value |
-| --- | --- |
-| Installer | `Medion CC_2_7_4.exe` |
-| Format | 32-bit Windows PE, Inno Setup 6.1.0 |
-| Installer size | 20,229,264 bytes |
-| SHA-256 | `963d90a6aea5f5ae3787bd3fcbdc775dcf40eb13bddf59f61b0b21ab2c16b224` |
-
-The managed application's `ECManager` calls `rwport.dll`, which sends byte-I/O
-requests to `WTIOportDrv.sys`. The read IOCTL is `0x9c402004` (`in al, dx`);
-the write IOCTL is `0x9c402008` (`out dx, al`). This is direct I/O, not WMI or a
-conventional fan-control API.
-
-Chassis lighting is implemented separately by the native `mcucontrol.dll`
-USB HID transport. Vendor installers, binaries, firmware captures, and
-disassembly output are not distributed with this project.
+The protocol was derived from MEDION's own Control Center for this laptop. Its
+fan manager talks to the embedded controller with direct byte I/O on two
+vendor ports (not WMI or a standard fan-control API), and its lighting module
+sends USB HID reports. Vendor installers, binaries, firmware captures and
+disassembly output are not part of this project.
 
 ## EC transport
 
@@ -59,8 +45,9 @@ write_byte(0x68, action)
 
 A selector is the second byte of this command protocol. It is not an I/O port
 or a demonstrated EC RAM offset. Complete transactions must not interleave.
-The vendor uses `Global\IO_Mutex`; the Linux app uses a single EC worker and
-an exclusive process lock at `/run/lock/medion-fan-control.lock`.
+The Linux daemon uses a single EC lock, an
+exclusive process lock at `/run/lock/medion-fan-control.lock`, and the
+module's single-opener rule.
 
 ## Supported commands
 
@@ -136,10 +123,43 @@ three complete passes with 50 ms between passes, and treats a short write as
 an error. It holds `/run/lock/medion-fan-control-lighting.lock` throughout the
 operation. It does not claim physical color readback.
 
+## Kernel allowlist (`x10_ec`)
+
+Under Secure Boot the daemon talks to `/dev/x10-ec` instead of `/dev/port`.
+The byte transport and the timing above are unchanged. The module additionally
+enforces this state machine for each open file:
+
+| After command | Accepted data byte |
+|---|---|
+| `0xd5` | `0x16`, `0x17`, `0x18`, `0x19` |
+| `0xdd` | `0x20`, `0x23` |
+| `0xde` | `0x01`, `0x02`, `0x03`, `0x05`, `0x0e`, `0x0f`, `0x10`, `0x11` |
+
+Any other command byte, a data byte without a preceding command, or a selector
+outside the list returns `EPERM` and is never sent to the hardware. Reads are
+only allowed at `0x68`. The device allows a single opener (`EBUSY` otherwise).
+
+## Voltage offsets (MSR 0x150)
+
+Opt-in through the module parameter `allow_undervolt=1`. The module uses the
+Intel OC mailbox on CPU 0:
+
+| Operation | Request (`EDX:EAX`) |
+|---|---|
+| Read plane *p* | `0x80000010 \| p << 8 : 0x00000000`, then read MSR 0x150 |
+| Write plane *p* | `0x80000011 \| p << 8 : (offset & 0x7ff) << 21` |
+
+The offset is an 11-bit two's-complement value in 1/1.024 mV units. Planes:
+0 core, 1 iGPU, 2 cache, 3 system agent (uncore), 4 analog I/O. A non-zero
+status in response bits 39:32 returns `EIO`. A readback that differs from the
+request by more than 1 mV returns `EPERM`; that happens when the firmware has
+undervolt protection and ignores the write.
+
 ## Scope and limitations
 
-The application exposes only firmware profiles, the global fan override, and
-static colors for the four verified zones. Animated lighting and independent
+The EC interface exposes only firmware profiles and the global fan override.
+Lighting is limited to static colors for the four verified zones. "Off" is
+static black, not a separate firmware command. Animated lighting and independent
 keyboard subzones are not implemented.
 
 There is no verified arbitrary fan RPM, PWM, fan-off, or temperature-curve

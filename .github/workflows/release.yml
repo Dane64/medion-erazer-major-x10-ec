@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+*"
 
 permissions:
   contents: read
@@ -43,6 +43,24 @@ jobs:
           fi
           python3 tools/release.py tag "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ steps.tag.outputs.prerelease }}
+        run: |
+          python3 tools/release.py notes "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          if [[ ! -s "$RUNNER_TEMP/release-notes.md" && "$PRERELEASE" != "true" ]]; then
+            echo "::error::CHANGELOG.md has no section for ${RELEASE_TAG#v}. Add one before tagging a final release."
+            exit 1
+          fi
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-notes-${{ github.sha }}
+          path: ${{ runner.temp }}/release-notes.md
+          retention-days: 7
+
   checks:
     name: Release checks
     needs: validate
@@ -62,6 +80,12 @@ jobs:
         with:
           name: dist-${{ github.sha }}
           path: dist
+
+      - name: Download release notes
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: release-notes-${{ github.sha }}
+          path: notes
 
       - name: Verify and publish release assets
         working-directory: dist
@@ -87,8 +111,13 @@ jobs:
             exit 1
           fi
           if [[ -z "$draft" ]]; then
+            if [[ -s ../notes/release-notes.md ]]; then
+              notes=(--notes-file ../notes/release-notes.md)
+            else
+              notes=(--generate-notes)
+            fi
             gh release create "$RELEASE_TAG" --verify-tag --draft \
-              --title "$RELEASE_TAG" --generate-notes --prerelease="$PRERELEASE"
+              --title "Erazer Control $VERSION" "${notes[@]}" --prerelease="$PRERELEASE"
           elif [[ "$draft" != "true" ]]; then
             echo "::error::Unexpected release state."
             exit 1
